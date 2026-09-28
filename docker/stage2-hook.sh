@@ -443,7 +443,11 @@ seed_one() {
 }
 seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
-seed_one "SOUL.md" "docker/SOUL.md"
+# SOUL.md is managed from GitHub: re-apply docker/SOUL.md on every boot so
+# tone edits pushed to the repo reach the running bot after each deploy.
+if [ -f "$INSTALL_DIR/docker/SOUL.md" ] && ! refuse_symlinked_path "seed" "$HERMES_HOME/SOUL.md"; then
+    as_hermes cp -f "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
+fi
 
 # --- Ensure a gateway api_server key exists (loopback control plane) ---
 # The gateway's aiohttp api_server refuses to start without a strong
