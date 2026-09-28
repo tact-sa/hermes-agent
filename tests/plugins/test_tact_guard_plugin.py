@@ -23,8 +23,20 @@ SNAPSHOT = "\n".join([
 ])
 
 
+# agent-browser 0.26 (Railway): ref shares one attribute bracket with other attributes.
+SNAPSHOT_AB026 = "\n".join([
+    '- heading "Web form" [level=1, ref=e1]',
+    '- combobox "Dropdown (select) " [expanded=false, ref=e8]: One',
+    '- option "One" [selected, ref=e9]',
+    '- option "Two" [ref=e10]',
+    '- checkbox " Checked checkbox" [checked=true, ref=e2]',
+    '- radio " Checked radio" [checked=true, ref=e3]',
+    '- button "Submit" [ref=e4]',
+])
+
+
 @pytest.fixture
-def manager(tmp_path, monkeypatch):
+def loaded_plugin(tmp_path, monkeypatch):
     import hermes_yaml as yaml
     from hermes_cli import plugins as pmod
 
@@ -37,11 +49,29 @@ def manager(tmp_path, monkeypatch):
     loaded = mgr._plugins["tact-guard"]
     assert loaded.enabled, loaded.error
     monkeypatch.setattr(pmod, "_plugin_manager", mgr)
+    return pmod, mgr, loaded.module
+
+
+def _feed(mgr, snapshot, url):
     mgr.invoke_hook(
-        "post_tool_call", tool_name="browser_navigate", args={"url": "https://clinic.example.sa/book"},
-        result=json.dumps({"success": True, "url": "https://clinic.example.sa/book", "snapshot": SNAPSHOT}),
+        "post_tool_call", tool_name="browser_navigate", args={"url": url},
+        result=json.dumps({"success": True, "url": url, "snapshot": snapshot}),
         task_id="t1", session_id="s1",
     )
+
+
+@pytest.fixture
+def manager(loaded_plugin):
+    pmod, mgr, _ = loaded_plugin
+    _feed(mgr, SNAPSHOT, "https://clinic.example.sa/book")
+    return pmod
+
+
+@pytest.fixture
+def web_form(loaded_plugin):
+    pmod, mgr, _ = loaded_plugin
+    extra = ['- button [ref=e20]', '- link "Home" [ref=e21]']
+    _feed(mgr, "\n".join([SNAPSHOT_AB026, *extra]), "https://www.selenium.dev/selenium/web/web-form.html")
     return pmod
 
 
@@ -74,6 +104,35 @@ def test_secret_fields_and_page_scripts_are_blocked(manager):
     assert d.action == "block" and "manager" in d.message
     assert _directive(manager, "browser_type", {"ref": "@e2", "text": "a@b.sa"}).action is None
     assert _directive(manager, "browser_console", {"expression": "document.forms[0].submit()"}).action == "block"
+
+
+def test_agent_browser_attribute_brackets_parse(loaded_plugin):
+    _, _, module = loaded_plugin
+    assert module.parse_snapshot(SNAPSHOT_AB026) == {
+        "e1": ("heading", "Web form"),
+        "e8": ("combobox", "Dropdown (select)"),
+        "e9": ("option", "One"),
+        "e10": ("option", "Two"),
+        "e2": ("checkbox", "Checked checkbox"),
+        "e3": ("radio", "Checked radio"),
+        "e4": ("button", "Submit"),
+    }
+
+
+@pytest.mark.parametrize("ref", ["@e2", "@e3", "@e8", "@e9", "@e10", "@e21"])
+def test_select_toggle_and_plain_link_clicks_are_allowed(web_form, ref):
+    assert _directive(web_form, "browser_click", {"ref": ref}).action is None
+
+
+@pytest.mark.parametrize("ref", ["@e4", "@e20", "@e99"])  # "Submit", unlabeled button, unknown ref
+def test_submit_capable_clicks_need_approval(web_form, ref):
+    assert _directive(web_form, "browser_click", {"ref": ref}).action == "approve"
+
+
+def test_password_vault_is_blocked(web_form):
+    d = _directive(web_form, "browser_vault_fill", {"ref": "@e4"})
+    assert d.action == "block"
+    assert d.message == "Saved passwords are disabled. Ask the manager to log in themselves."
 
 
 def test_managed_config_locks_down_telegram_but_keeps_browser_and_tact_guard(tmp_path, monkeypatch):

@@ -3,12 +3,14 @@
 ``post_tool_call`` remembers, per task/session, the ``ref -> (role, label)`` map from the latest
 browser snapshot plus the current page URL. ``pre_tool_call`` then:
 
-- escalates ``browser_click`` on a submit-type label (English/Arabic), or on a ref it cannot
-  resolve, to the human approval gate;
+- escalates ``browser_click`` to the human approval gate when the ref is unknown, or when a
+  submit-capable role (anything outside ``SAFE_ROLES``) has a submit-type label (English/Arabic)
+  or no label at all (plain links excepted);
 - escalates ``browser_press`` Enter (it may submit a focused form);
 - blocks ``browser_type`` into password / OTP / card / national-ID fields so the manager fills
   them personally;
-- blocks in-page script execution (``browser_console``, ``browser_cdp``, ``browser_exec``).
+- blocks in-page script execution (``browser_console``, ``browser_cdp``, ``browser_exec``) and the
+  saved-password vault (``browser_vault_*``).
 
 Every approval carries a fresh nonce in its ``rule_key`` so an "always"/"session" answer never
 turns into a standing allowlist entry: each submit asks again.
@@ -61,11 +63,18 @@ def is_sensitive_label(label: str) -> bool:
     return _matches(label, _SENSITIVE_EN_RE, _SENSITIVE_AR)
 
 
-# `- button "Book now" [ref=e12]`, `  - textbox [ref=e3]`, `- link "Home" [level=1] [ref=e4]`
+# `- button "Book now" [ref=e12]`, `  - textbox [ref=e3]`, and agent-browser 0.26's shared
+# attribute bracket: `- heading "Web form" [level=1, ref=e1]`, `- option "One" [selected, ref=e9]`
 _SNAPSHOT_LINE_RE = re.compile(
-    r'^\s*-\s*(?P<role>[A-Za-z][\w-]*)(?:\s+"(?P<label>(?:[^"\\]|\\.)*)")?[^\n]*?\[ref=(?P<ref>[^\]\s]+)\]',
+    r'^\s*-\s*(?P<role>[A-Za-z][\w-]*)(?:\s+"(?P<label>(?:[^"\\]|\\.)*)")?[^\n]*?\[[^\]\n]*?\bref=(?P<ref>[^\],\s]+)[^\]\n]*\]',
     re.MULTILINE,
 )
+
+# Roles whose click selects, focuses or toggles but cannot submit a form.
+SAFE_ROLES = frozenset({
+    "checkbox", "radio", "option", "combobox", "listbox", "textbox", "searchbox", "spinbutton",
+    "slider", "switch", "tab", "treeitem", "gridcell", "heading", "img", "StaticText",
+})
 
 _MAX_TRACKED = 256
 _lock = threading.Lock()
@@ -84,7 +93,7 @@ def _norm_ref(ref: Any) -> str:
 def parse_snapshot(text: str) -> Dict[str, Tuple[str, str]]:
     refs: Dict[str, Tuple[str, str]] = {}
     for m in _SNAPSHOT_LINE_RE.finditer(text or ""):
-        label = (m.group("label") or "").replace('\\"', '"')
+        label = (m.group("label") or "").replace('\\"', '"').strip()
         refs[_norm_ref(m.group("ref"))] = (m.group("role"), label)
     return refs
 
@@ -142,12 +151,18 @@ def _approve(kind: str, message: str) -> Dict[str, str]:
 
 
 _SCRIPT_TOOLS = frozenset({"browser_console", "browser_cdp", "browser_exec"})
+_VAULT_TOOLS = frozenset({
+    "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login",
+    "browser_vault_enter_code",
+})
 
 
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id: str = "",
                       session_id: str = "", **_: Any) -> Optional[Dict[str, str]]:
     if tool_name in _SCRIPT_TOOLS:
         return {"action": "block", "message": "Running scripts in pages is disabled for safety."}
+    if tool_name in _VAULT_TOOLS:
+        return {"action": "block", "message": "Saved passwords are disabled. Ask the manager to log in themselves."}
     if tool_name not in ("browser_click", "browser_press", "browser_type"):
         return None
     args = args if isinstance(args, dict) else {}
@@ -170,9 +185,15 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id:
                 "card or ID number). Do not type it. Ask the manager to fill that field themselves.")}
         return None
 
-    # browser_click: an unknown or unlabeled target is treated like a submit.
-    if not label or is_submit_label(label):
-        shown = label or (f"@{ref}" if ref else "an unknown element")
+    # browser_click. An unknown ref could be anything, so it asks. Known select/toggle/field roles
+    # cannot submit. Anything else asks on a submit word, or when unlabeled (except a plain link).
+    if not role:
+        shown = f"@{ref}" if ref else "an unknown element"
+        return _approve("click", f'Click "{shown}" on {domain}')
+    if role in SAFE_ROLES:
+        return None
+    if is_submit_label(label) or (not label and role != "link"):
+        shown = label or f"unlabeled {role} @{ref}"
         return _approve("click", f'Click "{shown}" on {domain}')
     return None
 
