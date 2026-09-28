@@ -75,8 +75,9 @@ def web_form(loaded_plugin):
     return pmod
 
 
-def _directive(pmod, tool_name, args):
-    return pmod._get_pre_tool_call_directive_details(tool_name, args, task_id="t1", session_id="s1")
+def _directive(pmod, tool_name, args, tool_call_id=""):
+    return pmod._get_pre_tool_call_directive_details(tool_name, args, task_id="t1", session_id="s1",
+                                                     tool_call_id=tool_call_id)
 
 
 @pytest.mark.parametrize("ref,label", [("@e12", "Book now"), ("@e13", "تأكيد الحجز")])
@@ -133,6 +134,62 @@ def test_password_vault_is_blocked(web_form):
     d = _directive(web_form, "browser_vault_fill", {"ref": "@e4"})
     assert d.action == "block"
     assert d.message == "Saved passwords are disabled. Ask the manager to log in themselves."
+
+
+LINKS = "\n".join([
+    '- link "Book a test drive" [ref=e30]',
+    '- link "احجز موعد" [ref=e31]',
+    '- link "Schedule a visit" [ref=e32]',
+    '- link "Pay now" [ref=e33]',
+    '- link "تأكيد الحجز" [ref=e34]',
+    '- link "Cancel booking" [ref=e35]',
+])
+
+
+@pytest.mark.parametrize("ref,action", [
+    ("@e30", None), ("@e31", None), ("@e32", None),  # links to a booking page only navigate
+    ("@e33", "approve"), ("@e34", "approve"), ("@e35", "approve"),  # pay / confirm / cancel still ask
+])
+def test_links_ask_only_for_non_booking_submit_words(loaded_plugin, ref, action):
+    pmod, mgr, _ = loaded_plugin
+    _feed(mgr, LINKS, "https://dealer.example.sa/")
+    assert _directive(pmod, "browser_click", {"ref": ref}).action == action
+
+
+def _click_ran(mgr, ref, tool_call_id, status):
+    mgr.invoke_hook("post_tool_call", tool_name="browser_click", args={"ref": ref}, result='{"success": true}',
+                    task_id="t1", session_id="s1", tool_call_id=tool_call_id, status=status)
+
+
+def test_approved_click_retry_is_allowed_for_120_seconds(loaded_plugin, monkeypatch):
+    pmod, mgr, module = loaded_plugin
+    clock = [1000.0]
+    monkeypatch.setattr(module, "_now", lambda: clock[0])
+    _feed(mgr, SNAPSHOT_AB026, "https://www.selenium.dev/selenium/web/web-form.html")
+
+    assert _directive(pmod, "browser_click", {"ref": "@e4"}, "c1").action == "approve"
+    _click_ran(mgr, "@e4", "c1", "ok")  # manager approved, the click ran
+    clock[0] += 60
+    # the page re-renders with new refs; the retry is keyed by label, not ref
+    _feed(mgr, SNAPSHOT_AB026.replace("ref=e4", "ref=e44"), "https://www.selenium.dev/selenium/web/web-form.html")
+    assert _directive(pmod, "browser_click", {"ref": "@e44"}, "c2").action is None
+    assert _directive(pmod, "browser_click", {"ref": "@e99"}, "c3").action == "approve"  # unknown still asks
+
+    clock[0] += 61  # 121s after the approval
+    assert _directive(pmod, "browser_click", {"ref": "@e44"}, "c4").action == "approve"
+
+
+def test_denied_or_other_domain_click_is_not_remembered(loaded_plugin, monkeypatch):
+    pmod, mgr, module = loaded_plugin
+    monkeypatch.setattr(module, "_now", lambda: 1000.0)
+    _feed(mgr, SNAPSHOT_AB026, "https://a.example.sa/form")
+    assert _directive(pmod, "browser_click", {"ref": "@e4"}, "c1").action == "approve"
+    _click_ran(mgr, "@e4", "c1", "blocked")  # manager tapped Deny
+    assert _directive(pmod, "browser_click", {"ref": "@e4"}, "c2").action == "approve"
+
+    _click_ran(mgr, "@e4", "c2", "ok")  # approved on a.example.sa
+    _feed(mgr, SNAPSHOT_AB026, "https://b.example.sa/form")
+    assert _directive(pmod, "browser_click", {"ref": "@e4"}, "c3").action == "approve"
 
 
 def test_managed_config_locks_down_telegram_but_keeps_browser_and_tact_guard(tmp_path, monkeypatch):

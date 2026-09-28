@@ -5,7 +5,8 @@ browser snapshot plus the current page URL. ``pre_tool_call`` then:
 
 - escalates ``browser_click`` to the human approval gate when the ref is unknown, or when a
   submit-capable role (anything outside ``SAFE_ROLES``) has a submit-type label (English/Arabic)
-  or no label at all (plain links excepted);
+  or no label at all. Links only navigate, so a link asks only for non-booking submit words
+  (pay, checkout, confirm, delete, cancel, buy, send, ...), never for "Book now"/"احجز";
 - escalates ``browser_press`` Enter (it may submit a focused form);
 - blocks ``browser_type`` into password / OTP / card / national-ID fields so the manager fills
   them personally;
@@ -13,7 +14,9 @@ browser snapshot plus the current page URL. ``pre_tool_call`` then:
   saved-password vault (``browser_vault_*``).
 
 Every approval carries a fresh nonce in its ``rule_key`` so an "always"/"session" answer never
-turns into a standing allowlist entry: each submit asks again.
+turns into a standing allowlist entry. The one exception is a retry: once the manager approves a
+click and it actually runs, the same label on the same domain in the same session is allowed
+again for ``APPROVAL_TTL_SECONDS`` (a click that did not change the page is usually retried).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
@@ -35,6 +39,9 @@ _SUBMIT_AR = (
     "إرسال", "ارسال", "حجز", "احجز", "تأكيد", "أكد", "تسجيل", "سجل", "دفع", "ادفع", "شراء", "طلب",
     "اطلب", "حذف", "إلغاء", "الغاء",
 )
+# Booking words are fine on a link: it only opens the booking page, and the final submit is a button.
+_LINK_OK_EN = frozenset({"book", "booking", "reserve", "schedule", "apply", "register", "request"})
+_LINK_OK_AR = frozenset({"حجز", "احجز"})
 _SENSITIVE_EN = ("password", "passcode", "otp", "card", "cvv", "cvc", "iban", "iqama", "national id")
 _SENSITIVE_AR = ("هوية", "إقامة", "كلمة المرور", "رمز التحقق", "بطاقة")
 
@@ -47,6 +54,8 @@ def _word_regex(words: Tuple[str, ...]) -> "re.Pattern[str]":
 
 
 _SUBMIT_EN_RE = _word_regex(_SUBMIT_EN)
+_LINK_ASK_EN_RE = _word_regex(tuple(w for w in _SUBMIT_EN if w not in _LINK_OK_EN))
+_LINK_ASK_AR = tuple(w for w in _SUBMIT_AR if w not in _LINK_OK_AR)
 _SENSITIVE_EN_RE = _word_regex(_SENSITIVE_EN)
 
 
@@ -57,6 +66,10 @@ def _matches(label: str, en_re: "re.Pattern[str]", ar_words: Tuple[str, ...]) ->
 
 def is_submit_label(label: str) -> bool:
     return _matches(label, _SUBMIT_EN_RE, _SUBMIT_AR)
+
+
+def is_link_submit_label(label: str) -> bool:
+    return _matches(label, _LINK_ASK_EN_RE, _LINK_ASK_AR)
 
 
 def is_sensitive_label(label: str) -> bool:
@@ -77,9 +90,49 @@ SAFE_ROLES = frozenset({
 })
 
 _MAX_TRACKED = 256
+APPROVAL_TTL_SECONDS = 120.0
 _lock = threading.Lock()
 # state key -> {"refs": {ref: (role, label)}, "url": str}
 _pages: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+# pending key -> (state key, domain, label) for a click sent to the approval gate
+_pending: "OrderedDict[str, Tuple[str, str, str]]" = OrderedDict()
+# (state key, domain, label) -> monotonic time the approved click ran
+_approved: "OrderedDict[Tuple[str, str, str], float]" = OrderedDict()
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _pending_key(state_key: str, tool_call_id: Any, ref: str) -> str:
+    return f"{state_key}\x00{tool_call_id or '@' + ref}"
+
+
+def _trim(d: "OrderedDict[Any, Any]") -> None:
+    while len(d) > _MAX_TRACKED:
+        d.popitem(last=False)
+
+
+def _recently_approved(approval: Tuple[str, str, str]) -> bool:
+    with _lock:
+        at = _approved.get(approval)
+        if at is None:
+            return False
+        if _now() - at <= APPROVAL_TTL_SECONDS:
+            return True
+        del _approved[approval]
+        return False
+
+
+def _record_click_outcome(state_key: str, tool_call_id: Any, args: Any, status: Any) -> None:
+    """A gated click that reached the tool (status not "blocked") was approved by the manager."""
+    ref = _norm_ref(args.get("ref")) if isinstance(args, dict) else ""
+    with _lock:
+        approval = _pending.pop(_pending_key(state_key, tool_call_id, ref), None)
+        if approval is not None and status != "blocked":
+            _approved.pop(approval, None)
+            _approved[approval] = _now()
+            _trim(_approved)
 
 
 def _state_key(task_id: Any, session_id: Any) -> str:
@@ -114,9 +167,12 @@ def _result_parts(result: Any) -> Tuple[str, str]:
 
 
 def _on_post_tool_call(tool_name: str = "", args: Optional[dict] = None, result: Any = None,
-                       task_id: str = "", session_id: str = "", **_: Any) -> None:
+                       task_id: str = "", session_id: str = "", tool_call_id: str = "",
+                       status: str = "", **_: Any) -> None:
     if not str(tool_name).startswith("browser_"):
         return
+    if tool_name == "browser_click":
+        _record_click_outcome(_state_key(task_id, session_id), tool_call_id, args, status)
     snapshot, url = _result_parts(result)
     if not url and tool_name == "browser_navigate" and isinstance(args, dict):
         url = str(args.get("url") or "")
@@ -131,8 +187,7 @@ def _on_post_tool_call(tool_name: str = "", args: Optional[dict] = None, result:
         if url:
             page["url"] = url
         _pages[key] = page
-        while len(_pages) > _MAX_TRACKED:
-            _pages.popitem(last=False)
+        _trim(_pages)
 
 
 def _page(task_id: Any, session_id: Any) -> Dict[str, Any]:
@@ -158,7 +213,7 @@ _VAULT_TOOLS = frozenset({
 
 
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id: str = "",
-                      session_id: str = "", **_: Any) -> Optional[Dict[str, str]]:
+                      session_id: str = "", tool_call_id: str = "", **_: Any) -> Optional[Dict[str, str]]:
     if tool_name in _SCRIPT_TOOLS:
         return {"action": "block", "message": "Running scripts in pages is disabled for safety."}
     if tool_name in _VAULT_TOOLS:
@@ -192,10 +247,18 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id:
         return _approve("click", f'Click "{shown}" on {domain}')
     if role in SAFE_ROLES:
         return None
-    if is_submit_label(label) or (not label and role != "link"):
-        shown = label or f"unlabeled {role} @{ref}"
-        return _approve("click", f'Click "{shown}" on {domain}')
-    return None
+    if not label:
+        return None if role == "link" else _approve("click", f'Click "unlabeled {role} @{ref}" on {domain}')
+    if not (is_link_submit_label(label) if role == "link" else is_submit_label(label)):
+        return None
+    key = _state_key(task_id, session_id)
+    approval = (key, domain, label)
+    if _recently_approved(approval):
+        return None
+    with _lock:
+        _pending[_pending_key(key, tool_call_id, ref)] = approval
+        _trim(_pending)
+    return _approve("click", f'Click "{label}" on {domain}')
 
 
 def register(ctx) -> None:
