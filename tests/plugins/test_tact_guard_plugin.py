@@ -138,6 +138,42 @@ def test_unlabeled_generic_click_is_allowed_but_unlabeled_button_asks(loaded_plu
     assert _directive(pmod, "browser_click", {"ref": "@e42"}).action == "approve"  # unknown ref
 
 
+CODE_AND_SECRET_FIELDS = "\n".join([
+    '- textbox "Enter the OTP" [ref=e50]',
+    '- textbox "One-time passcode" [ref=e51]',
+    '- textbox "Verification code sent to 05xxxxxxxx" [ref=e52]',
+    '- textbox "رمز التحقق" [ref=e53]',
+    '- textbox "رمز التأكيد" [ref=e54]',
+    '- textbox "Password" [ref=e60]',
+    '- textbox "Card number" [ref=e61]',
+    '- textbox "Card verification code (CVV)" [ref=e62]',
+    '- textbox "IBAN" [ref=e63]',
+    '- textbox "رقم الهوية الوطنية" [ref=e64]',
+    '- textbox "كلمة المرور" [ref=e65]',
+])
+
+
+@pytest.mark.parametrize("ref", ["@e50", "@e51", "@e52", "@e53", "@e54"])
+def test_verification_code_field_asks_every_time(loaded_plugin, ref):
+    pmod, mgr, _ = loaded_plugin
+    _feed(mgr, CODE_AND_SECRET_FIELDS, "https://clinic.example.sa/verify")
+    first = _directive(pmod, "browser_type", {"ref": ref, "text": "482913"}, "c1")
+    mgr.invoke_hook("post_tool_call", tool_name="browser_type", args={"ref": ref, "text": "482913"},
+                    result='{"success": true}', task_id="t1", session_id="s1", tool_call_id="c1", status="ok")
+    second = _directive(pmod, "browser_type", {"ref": ref, "text": "482913"}, "c2")
+    assert first.action == second.action == "approve"
+    assert first.message == "Enter verification code on clinic.example.sa"
+    assert first.rule_key != second.rule_key  # no reuse, no retry memory
+
+
+@pytest.mark.parametrize("ref", ["@e60", "@e61", "@e62", "@e63", "@e64", "@e65"])
+def test_password_card_iban_and_id_fields_stay_blocked(loaded_plugin, ref):
+    pmod, mgr, _ = loaded_plugin
+    _feed(mgr, CODE_AND_SECRET_FIELDS, "https://clinic.example.sa/verify")
+    d = _directive(pmod, "browser_type", {"ref": ref, "text": "x"})
+    assert d.action == "block" and "manager" in d.message
+
+
 def test_password_vault_is_blocked(web_form):
     d = _directive(web_form, "browser_vault_fill", {"ref": "@e4"})
     assert d.action == "block"

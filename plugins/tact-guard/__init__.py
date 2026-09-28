@@ -9,8 +9,9 @@ browser snapshot plus the current page URL. ``pre_tool_call`` then:
   so a link asks only for non-booking submit words (pay, checkout, confirm, delete, cancel,
   buy, send, ...), never for "Book now"/"احجز";
 - escalates ``browser_press`` Enter (it may submit a focused form);
-- blocks ``browser_type`` into password / OTP / card / national-ID fields so the manager fills
-  them personally;
+- escalates ``browser_type`` into a verification-code field (OTP, SMS/email code) so each code the
+  manager sends in chat is confirmed before it is typed, and blocks typing into password / card /
+  IBAN / national-ID fields so the manager fills them personally;
 - blocks in-page script execution (``browser_console``, ``browser_cdp``, ``browser_exec``) and the
   saved-password vault (``browser_vault_*``).
 
@@ -43,14 +44,18 @@ _SUBMIT_AR = (
 # Booking words are fine on a link: it only opens the booking page, and the final submit is a button.
 _LINK_OK_EN = frozenset({"book", "booking", "reserve", "schedule", "apply", "register", "request"})
 _LINK_OK_AR = frozenset({"حجز", "احجز"})
-_SENSITIVE_EN = ("password", "passcode", "otp", "card", "cvv", "cvc", "iban", "iqama", "national id")
-_SENSITIVE_AR = ("هوية", "إقامة", "كلمة المرور", "رمز التحقق", "بطاقة")
+_SENSITIVE_EN = ("password", "card", "cvv", "cvc", "iban", "iqama", "national id")
+_SENSITIVE_AR = ("هوية", "إقامة", "كلمة المرور", "بطاقة")
+# One-time codes the manager relays from an SMS/email: typed only after a per-code confirmation.
+_CODE_EN = ("otp", "one-time", "verification code", "passcode", "code sent")
+_CODE_AR = ("رمز التحقق", "رمز التأكيد")
 
 
 def _word_regex(words: Tuple[str, ...]) -> "re.Pattern[str]":
     # English words match on word boundaries ("Facebook" is not "book"); spaces inside a phrase
     # accept any run of whitespace, hyphen or underscore ("sign-up", "place  order").
-    alts = sorted((re.escape(w).replace(r"\ ", r"[\s_-]+") for w in words), key=len, reverse=True)
+    alts = sorted((re.escape(w).replace(r"\ ", r"[\s_-]+").replace(r"\-", r"[\s_-]+") for w in words),
+                  key=len, reverse=True)
     return re.compile(r"(?<![a-z0-9])(?:" + "|".join(alts) + r")(?![a-z0-9])", re.IGNORECASE)
 
 
@@ -58,6 +63,7 @@ _SUBMIT_EN_RE = _word_regex(_SUBMIT_EN)
 _LINK_ASK_EN_RE = _word_regex(tuple(w for w in _SUBMIT_EN if w not in _LINK_OK_EN))
 _LINK_ASK_AR = tuple(w for w in _SUBMIT_AR if w not in _LINK_OK_AR)
 _SENSITIVE_EN_RE = _word_regex(_SENSITIVE_EN)
+_CODE_EN_RE = _word_regex(_CODE_EN)
 
 
 def _matches(label: str, en_re: "re.Pattern[str]", ar_words: Tuple[str, ...]) -> bool:
@@ -75,6 +81,10 @@ def is_link_submit_label(label: str) -> bool:
 
 def is_sensitive_label(label: str) -> bool:
     return _matches(label, _SENSITIVE_EN_RE, _SENSITIVE_AR)
+
+
+def is_code_label(label: str) -> bool:
+    return _matches(label, _CODE_EN_RE, _CODE_AR)
 
 
 # `- button "Book now" [ref=e12]`, `  - textbox [ref=e3]`, and agent-browser 0.26's shared
@@ -235,10 +245,13 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id:
     role, label = page["refs"].get(ref, ("", ""))
 
     if tool_name == "browser_type":
-        if label and is_sensitive_label(label):
+        if label and is_sensitive_label(label):  # checked first: "Card verification code" stays blocked
             return {"action": "block", "message": (
-                f'The field "{label}" on {domain} holds sensitive data (password, verification code, '
-                "card or ID number). Do not type it. Ask the manager to fill that field themselves.")}
+                f'The field "{label}" on {domain} holds sensitive data (password, card, IBAN or ID '
+                "number). Do not type it. Ask the manager to fill that field themselves.")}
+        if label and is_code_label(label):
+            # Fresh nonce, no retry memory: every code is confirmed on its own.
+            return _approve("code", f"Enter verification code on {domain}")
         return None
 
     # browser_click. An unknown ref could be anything, so it asks. Known select/toggle/field roles
