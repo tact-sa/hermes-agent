@@ -130,6 +130,14 @@ def test_submit_capable_clicks_need_approval(web_form, ref):
     assert _directive(web_form, "browser_click", {"ref": ref}).action == "approve"
 
 
+def test_unlabeled_generic_click_is_allowed_but_unlabeled_button_asks(loaded_plugin):
+    pmod, mgr, _ = loaded_plugin
+    _feed(mgr, "\n".join(['- generic [ref=e40]', '- button [ref=e41]']), "https://clinic.example.sa/calendar")
+    assert _directive(pmod, "browser_click", {"ref": "@e40"}).action is None
+    assert _directive(pmod, "browser_click", {"ref": "@e41"}).action == "approve"
+    assert _directive(pmod, "browser_click", {"ref": "@e42"}).action == "approve"  # unknown ref
+
+
 def test_password_vault_is_blocked(web_form):
     d = _directive(web_form, "browser_vault_fill", {"ref": "@e4"})
     assert d.action == "block"

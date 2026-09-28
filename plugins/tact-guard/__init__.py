@@ -5,8 +5,9 @@ browser snapshot plus the current page URL. ``pre_tool_call`` then:
 
 - escalates ``browser_click`` to the human approval gate when the ref is unknown, or when a
   submit-capable role (anything outside ``SAFE_ROLES``) has a submit-type label (English/Arabic)
-  or no label at all. Links only navigate, so a link asks only for non-booking submit words
-  (pay, checkout, confirm, delete, cancel, buy, send, ...), never for "Book now"/"احجز";
+  or no label at all (an unlabeled link or generic div/span is allowed). Links only navigate,
+  so a link asks only for non-booking submit words (pay, checkout, confirm, delete, cancel,
+  buy, send, ...), never for "Book now"/"احجز";
 - escalates ``browser_press`` Enter (it may submit a focused form);
 - blocks ``browser_type`` into password / OTP / card / national-ID fields so the manager fills
   them personally;
@@ -248,7 +249,10 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id:
     if role in SAFE_ROLES:
         return None
     if not label:
-        return None if role == "link" else _approve("click", f'Click "unlabeled {role} @{ref}" on {domain}')
+        # Plain links and generic divs/spans (e.g. calendar day cells) do not submit on their own.
+        if role in ("link", "generic"):
+            return None
+        return _approve("click", f'Click "unlabeled {role} @{ref}" on {domain}')
     if not (is_link_submit_label(label) if role == "link" else is_submit_label(label)):
         return None
     key = _state_key(task_id, session_id)
