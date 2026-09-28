@@ -1,6 +1,39 @@
-# Tact managed (administrator-pinned) config. Copied as config.yaml into the directory that
-# HERMES_MANAGED_DIR points at; its values overlay the user's config.yaml and cannot be changed
-# from inside the bot. Lists replace, they do not merge: keep every plugin you want here.
+# Tact managed (administrator-pinned) config. The Dockerfile copies this file to
+# /etc/hermes/config.yaml, which Hermes reads automatically as its managed scope. Its values
+# overlay the user's config.yaml and cannot be changed from inside the bot.
+# Lists replace, they do not merge: every entry you want must be listed here.
+
+# Plugins: tact-guard requires a human Approve/Deny before the browser submits anything,
+# refuses typing into password/OTP/card/ID fields, and blocks in-page scripts.
 plugins:
   enabled:
     - tact-guard
+
+agent:
+  # Toolsets a secretary bot does not need. Each one is a way to run code, touch files, reach
+  # other accounts or devices, or spend money without passing through tact-guard.
+  # "browser" is deliberately kept enabled so the bot can open links and make bookings.
+  disabled_toolsets:
+    - terminal
+    - file
+    - code_execution
+    - computer_use
+    - delegation
+    - connections
+    - desktop_ui
+    - project
+    - kanban
+    - homeassistant
+    - spotify
+    - image_gen
+    - video_gen
+
+# Approvals: always ask the manager in chat; scheduled (cron) jobs have nobody to ask, so any
+# action that needs approval is refused there instead of being auto-approved.
+approvals:
+  mode: manual
+  cron_mode: deny
+
+# Security: mask API keys and tokens in tool output before the model or the chat sees them.
+security:
+  redact_secrets: true

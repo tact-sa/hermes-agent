@@ -76,9 +76,14 @@ def test_secret_fields_and_page_scripts_are_blocked(manager):
     assert _directive(manager, "browser_console", {"expression": "document.forms[0].submit()"}).action == "block"
 
 
-def test_managed_config_enables_tact_guard(tmp_path, monkeypatch):
+def test_managed_config_locks_down_telegram_but_keeps_browser_and_tact_guard(tmp_path, monkeypatch):
+    """tact/managed-config.yaml, baked to /etc/hermes/config.yaml, enables tact-guard and strips
+    every code/file/account toolset from the Telegram bot while browser, memory and cron remain."""
     from gateway.run import _load_gateway_config
+    from hermes_cli import plugins as pmod
     from hermes_cli.managed_scope import invalidate_managed_cache
+    from hermes_cli.tools_config import _get_platform_tools
+    from model_tools import _select_tool_names
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -91,7 +96,19 @@ def test_managed_config_enables_tact_guard(tmp_path, monkeypatch):
     invalidate_managed_cache()
     try:
         cfg = _load_gateway_config(home / "config.yaml")
+        assert "tact-guard" in cfg["plugins"]["enabled"]
+        assert cfg["model"]["default"] == "some/model"  # user config still underneath
+
+        tools = _select_tool_names(sorted(_get_platform_tools(cfg, "telegram")),
+                                   cfg["agent"]["disabled_toolsets"], quiet_mode=True)
+        assert not tools & {"terminal", "read_file", "write_file", "execute_code", "manage_connections"}
+        assert {"browser_navigate", "browser_click", "browser_type", "memory", "cronjob_manage",
+                "web_search", "session_search"} <= tools
+
+        mgr = pmod.PluginManager()
+        mgr.discover_and_load()
+        loaded = mgr._plugins["tact-guard"]
+        assert loaded.enabled, loaded.error
+        assert {"pre_tool_call", "post_tool_call"} <= set(loaded.hooks_registered)
     finally:
         invalidate_managed_cache()
-    assert "tact-guard" in cfg["plugins"]["enabled"]
-    assert cfg["model"]["default"] == "some/model"  # user config still underneath
