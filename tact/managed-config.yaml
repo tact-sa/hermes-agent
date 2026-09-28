@@ -1,0 +1,6 @@
+# Tact managed (administrator-pinned) config. Copied as config.yaml into the directory that
+# HERMES_MANAGED_DIR points at; its values overlay the user's config.yaml and cannot be changed
+# from inside the bot. Lists replace, they do not merge: keep every plugin you want here.
+plugins:
+  enabled:
+    - tact-guard

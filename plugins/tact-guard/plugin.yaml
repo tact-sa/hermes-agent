@@ -1,0 +1,7 @@
+name: tact-guard
+version: "0.1.0"
+description: "Require a human Approve/Deny before the browser submits anything (clicks on submit-type buttons, Enter), refuse typing into password/OTP/card/ID fields, and block in-page script execution (browser_console, browser_cdp, browser_exec)."
+author: "Tact"
+provides_hooks:
+  - post_tool_call
+  - pre_tool_call
