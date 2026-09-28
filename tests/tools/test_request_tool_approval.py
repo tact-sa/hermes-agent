@@ -197,6 +197,7 @@ class TestRequestToolApproval:
         assert res["approved"] is True
         assert len(notified) == 1
         assert notified[0]["pattern_key"] == "plugin_rule:unlock"
+        assert notified[0]["plugin_rule"] is True  # gateway renders the plain Confirm/Cancel card
 
     def test_api_server_without_exec_ask_remains_fail_closed(self, monkeypatch):
         """An api_server call without an active approval bridge must not run ungated."""

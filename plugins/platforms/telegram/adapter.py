@@ -138,7 +138,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
+from gateway.platforms.base_exec_approval import EA_HEADER_TEXT, EA_PLUGIN_HEADER_TEXT
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
@@ -668,6 +668,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: Dict[str, dict] = {}
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
+        self._plugin_approval_ids: set = set()  # approval ids whose card is a plugin Confirm/Cancel
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
         # "important" (default): only final responses, approvals and slash confirmations notify;
@@ -4239,6 +4240,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Template attrs for the shared _format_exec_approval core (HTML mode).
     _EA_HEADER = f"⚠️ <b>{EA_HEADER_TEXT}</b>\n\n"
+    _EA_PLUGIN_HEADER = f"🔐 <b>{EA_PLUGIN_HEADER_TEXT}</b>\n\n"
     _EA_CODE_OPEN = "<pre>"
     _EA_CODE_CLOSE = "</pre>\n\n"
     _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
@@ -4257,6 +4259,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return max(0, self.MAX_MESSAGE_LENGTH - fixed)
 
     _EA_ACTION_LABELS = {"once": "✅ Allow Once", "session": "✅ Session", "always": "✅ Always", "deny": "❌ Deny"}
+    _EA_PLUGIN_ACTION_LABELS = {"once": "✅ Confirm", "deny": "❌ Cancel"}
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Inline-keyboard approval prompt; buttons call ``resolve_gateway_approval()`` like the
@@ -4269,8 +4272,11 @@ class TelegramAdapter(BasePlatformAdapter):
             approval_id = next(self._approval_counter)
             buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
                        for label, choice, _ in prompt.actions]
-            return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
-                lambda msg: self._approval_state.__setitem__(approval_id, prompt.session_key))
+            def register(msg):
+                self._approval_state[approval_id] = prompt.session_key
+                if prompt.plugin_rule:
+                    self._plugin_approval_ids.add(approval_id)
+            return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), register
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(prompt.metadata), reply_to_mode=self._reply_to_mode)
@@ -4751,6 +4757,8 @@ class TelegramAdapter(BasePlatformAdapter):
             "This approval has already been resolved.")
         if not session_key:
             return
+        plugin_rule = approval_id in self._plugin_approval_ids
+        self._plugin_approval_ids.discard(approval_id)
         user_display = getattr(query.from_user, "first_name", "User")
         # Resolve FIRST (unblocks the agent thread), render after: a tap landing after the wait timed out
         # (count == 0) must NOT claim "Approved" — the command was already denied.
@@ -4765,7 +4773,10 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
             count = 0
-        if count:
+        if count and plugin_rule:
+            label = {"once": "✅ Confirmed", "deny": "❌ Cancelled"}.get(choice, "Resolved")
+            edit_text = label
+        elif count:
             label_map = {
                 "once": "✅ Approved once", "session": "✅ Approved for session", "always": "✅ Approved permanently", "deny": "❌ Denied",
             }

@@ -14,6 +14,9 @@ from __future__ import annotations
 # Bare strings; adapters add their own bold/HTML around them.
 EA_HEADER_TEXT = "Hermes wants to run a command that needs your OK"
 EA_REASON_LABEL_TEXT = "Why it was flagged"
+# Plugin approval rules (``tools.approval.request_tool_approval``) ask the owner to confirm an
+# everyday action (e.g. a booking click), so their card is a plain confirmation, not a warning.
+EA_PLUGIN_HEADER_TEXT = "Please confirm"
 
 # Timeout notice posted when nobody answered the prompt (``{window}`` = "5 minutes").
 APPROVAL_TIMED_OUT_NOTICE = (
@@ -37,6 +40,11 @@ def format_approval_window(seconds: int) -> str:
 def format_approval_deadline_line(timeout_s: int) -> str:
     """The last line of every approval prompt: doing nothing is a safe no."""
     return f"If you don't answer within {format_approval_window(timeout_s)} it will NOT run."
+
+
+def format_plugin_approval_deadline_line(timeout_s: int) -> str:
+    """Deadline line of a plugin confirmation card: doing nothing means nothing happens."""
+    return f"If you don't answer within {format_approval_window(timeout_s)}, nothing will be done."
 
 
 def format_approval_timed_out_notice(timeout_s: int) -> str:

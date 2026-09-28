@@ -419,7 +419,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
-    EA_HEADER_TEXT, EA_REASON_LABEL_TEXT, approval_timeout_seconds, format_approval_deadline_line)
+    EA_HEADER_TEXT, EA_PLUGIN_HEADER_TEXT, EA_REASON_LABEL_TEXT, approval_timeout_seconds,
+    format_approval_deadline_line, format_plugin_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from gateway.session import SessionSource, build_session_key
@@ -1629,6 +1630,7 @@ class ExecApprovalPrompt:
     description: str
     smart_denied: bool
     metadata: Optional[Dict[str, Any]] = None
+    plugin_rule: bool = False  # plugin approval rule: rendered as a plain Confirm/Cancel card
 
     @property
     def choices(self) -> List[str]:
@@ -2730,6 +2732,8 @@ class BasePlatformAdapter(ABC):
     _EA_SMART_DENY_LINE: str = "\n\nSmart DENY: owner override applies to this one operation only."
     _EA_CMD_BUDGET: int = 3000
     _EA_REASON_BUDGET: int = 0  # 0 = the reason is never truncated
+    # Plugin approval rules render a plain confirmation: header + description + deadline line.
+    _EA_PLUGIN_HEADER: str = f"🔐 {EA_PLUGIN_HEADER_TEXT}\n\n"
 
     @staticmethod
     def _truncate_preview(text: str, budget: int, suffix: str = "...") -> str:
@@ -2769,12 +2773,18 @@ class BasePlatformAdapter(ABC):
         return self._EA_DEADLINE_PREFIX + self._ea_escape(format_approval_deadline_line(approval_timeout_seconds()))
 
     def _format_exec_approval(
-        self, command: str, description: str = "dangerous command", smart_denied: bool = False) -> str:
+        self, command: str, description: str = "dangerous command", smart_denied: bool = False,
+        plugin_rule: bool = False) -> str:
         """Shared exec-approval prompt text: header + fenced (truncated) command + why it was
         flagged + the deadline line, plus the smart-deny line. Buttons/trailing instructions stay
-        platform-local."""
+        platform-local. A ``plugin_rule`` approval is a plain confirmation of the description
+        (e.g. ``Click "Reserve Now" on example.com``): no command block, no "why flagged"."""
         if self._EA_REASON_BUDGET:
             description = self._ea_fit(str(description or ""), self._EA_REASON_BUDGET)
+        if plugin_rule:
+            deadline = format_plugin_approval_deadline_line(approval_timeout_seconds())
+            return (f"{self._EA_PLUGIN_HEADER}{self._ea_escape(description)}"
+                    f"{self._EA_DEADLINE_PREFIX}{self._ea_escape(deadline)}")
         cmd_preview = self._ea_fit(
             str(command or ""), self._exec_approval_cmd_budget(description, smart_denied))
         text = (f"{self._EA_HEADER}"
@@ -2788,12 +2798,17 @@ class BasePlatformAdapter(ABC):
     _EA_ACTION_LABELS: Dict[str, str] = {
         "once": "Allow Once", "session": "Allow Session", "always": "Always Allow", "deny": "Deny"}
     _EA_ACTION_STYLES: Dict[str, str] = {"once": "primary", "deny": "danger"}
+    _EA_PLUGIN_ACTION_LABELS: Dict[str, str] = {"once": "Confirm", "deny": "Cancel"}
 
     def _exec_approval_actions(
-            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> List[Tuple[str, str, str]]:
+            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool,
+            plugin_rule: bool = False) -> List[Tuple[str, str, str]]:
         """``(label, choice, style)`` rows for the approval buttons. A smart deny is an owner
         override for one operation only, so it offers neither the session nor the permanent tier;
-        the permanent tier is never offered without the session tier."""
+        the permanent tier is never offered without the session tier. A ``plugin_rule``
+        confirmation is always one-shot: Confirm (once) or Cancel (deny)."""
+        if plugin_rule:
+            return [(self._EA_PLUGIN_ACTION_LABELS[c], c, self._EA_ACTION_STYLES.get(c, "")) for c in ("once", "deny")]
         choices = ["once"]
         if not smart_denied and allow_session:
             choices.append("session")
@@ -2811,17 +2826,18 @@ class BasePlatformAdapter(ABC):
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
-        smart_denied: bool = False,
+        smart_denied: bool = False, plugin_rule: bool = False,
     ) -> SendResult:
         """Interactive exec-approval prompt; a press resolves via
         ``tools.approval.resolve_gateway_approval``. Text and choice set are shared; adapters
         render them natively in ``_send_exec_approval_prompt``."""
         prompt = ExecApprovalPrompt(
             chat_id=chat_id, session_key=session_key, metadata=metadata, command=str(command or ""),
-            description=description, smart_denied=smart_denied,
-            text=self._format_exec_approval(command, description, smart_denied),
+            description=description, smart_denied=smart_denied, plugin_rule=plugin_rule,
+            text=self._format_exec_approval(command, description, smart_denied, plugin_rule=plugin_rule),
             actions=self._exec_approval_actions(
-                allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied))
+                allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied,
+                plugin_rule=plugin_rule))
         return await self._send_exec_approval_prompt(prompt)
 
     async def _send_exec_approval_prompt(self, prompt: "ExecApprovalPrompt") -> SendResult:
