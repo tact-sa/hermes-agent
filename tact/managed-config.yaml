@@ -5,9 +5,19 @@
 
 # Plugins: tact-guard requires a human Approve/Deny before the browser submits anything,
 # refuses typing into password/OTP/card/ID fields, and blocks in-page scripts.
+# tact-meetings logs meetings and sends a Battle Card 10 minutes before and a reminder at start.
 plugins:
   enabled:
     - tact-guard
+    - tact-meetings
+
+# The manager works in Riyadh: reminders, meeting times and "now" are all Riyadh time.
+timezone: Asia/Riyadh
+
+# Scheduled messages (reminders, Battle Cards) arrive as plain messages, without the
+# "Cronjob Response: <job>" header and the "to stop this job" footer.
+cron:
+  wrap_response: false
 
 agent:
   # Toolsets a secretary bot does not need. Each one is a way to run code, touch files, reach
