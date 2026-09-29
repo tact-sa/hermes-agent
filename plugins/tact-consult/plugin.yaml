@@ -1,0 +1,6 @@
+name: tact-consult
+version: "0.1.0"
+description: "Executive strategic consultant, used ONLY when the manager types /consult <question>. The instructions live in this plugin (not in a skill), so the model can never load or apply them on its own."
+author: "Tact"
+provides_hooks:
+  - pre_gateway_dispatch

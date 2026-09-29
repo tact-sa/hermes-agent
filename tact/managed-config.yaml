@@ -6,10 +6,12 @@
 # Plugins: tact-guard requires a human Approve/Deny before the browser submits anything,
 # refuses typing into password/OTP/card/ID fields, and blocks in-page scripts.
 # tact-meetings logs meetings and sends an advance reminder 10 minutes before and a reminder at start.
+# tact-consult answers "/consult <question>" as an executive strategy consultant (only when typed).
 plugins:
   enabled:
     - tact-guard
     - tact-meetings
+    - tact-consult
 
 # The manager works in Riyadh: reminders, meeting times and "now" are all Riyadh time.
 timezone: Asia/Riyadh
