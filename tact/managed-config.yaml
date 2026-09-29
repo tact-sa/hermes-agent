@@ -40,6 +40,15 @@ agent:
     - image_gen
     - video_gen
 
+# Voice notes: transcribed by Groq Whisper using GROQ_API_KEY (set in Railway). The provider is
+# pinned because auto-detection does not reliably pick Groq. language is left empty so Whisper
+# auto-detects each note and both English and Arabic work: Hermes's built-in default is "en",
+# which would force Arabic notes through English decoding.
+stt:
+  enabled: true
+  provider: groq
+  language: ""
+
 # Approvals: always ask the manager in chat; scheduled (cron) jobs have nobody to ask, so any
 # action that needs approval is refused there instead of being auto-approved.
 approvals:

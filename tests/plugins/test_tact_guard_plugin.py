@@ -272,3 +272,28 @@ def test_managed_config_locks_down_telegram_but_keeps_browser_and_tact_guard(tmp
         assert {"pre_tool_call", "post_tool_call"} <= set(loaded.hooks_registered)
     finally:
         invalidate_managed_cache()
+
+
+def test_managed_config_transcribes_voice_with_groq_auto_language(tmp_path, monkeypatch):
+    """tact/managed-config.yaml pins Telegram voice notes to Groq Whisper with language
+    auto-detection (English and Arabic), overriding a user config that picks local/English."""
+    from hermes_cli.managed_scope import invalidate_managed_cache
+    from tools import transcription_tools as stt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("stt:\n  provider: local\n  language: en\n")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    shutil.copy(REPO_ROOT / "tact" / "managed-config.yaml", managed / "config.yaml")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setattr(stt, "_HAS_OPENAI", True)
+    invalidate_managed_cache()
+    try:
+        cfg = stt._load_stt_config()
+        assert stt._get_provider(cfg) == "groq"
+        assert stt._resolve_stt_language("groq", cfg) is None
+    finally:
+        invalidate_managed_cache()
