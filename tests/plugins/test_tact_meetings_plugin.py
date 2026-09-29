@@ -126,3 +126,110 @@ def test_cancel_removes_jobs_and_silences_the_meeting(meetings):
     assert _jobs_for(meeting_id) == (None, None)
     assert f"#{meeting_id} " not in module._cmd_meetings("")
     assert "No scheduled meeting" in module._cmd_cancel(str(meeting_id))
+
+
+# -- DaysLeft sync -----------------------------------------------------------------------------
+
+DAYSLEFT_KEY = "dl-secret-key-123"
+
+
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def daysleft(meetings, monkeypatch):
+    """Records every DaysLeft request; ``outcomes`` is consumed per call (status int or exception)."""
+    import urllib.request
+    monkeypatch.setenv("DAYSLEFT_URL", "https://daysleft.example/")
+    monkeypatch.setenv("DAYSLEFT_API_KEY", DAYSLEFT_KEY)
+    calls, outcomes = [], []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append({"method": req.get_method(), "url": req.full_url, "timeout": timeout,
+                      "auth": req.get_header("Authorization"),
+                      "body": json.loads(req.data) if req.data else None})
+        outcome = outcomes.pop(0) if outcomes else 201
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome >= 400:
+            import urllib.error
+            raise urllib.error.HTTPError(req.full_url, outcome, "err", {}, None)
+        return _Resp(outcome)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return meetings, calls, outcomes
+
+
+def test_daysleft_task_added_on_log_and_removed_on_cancel(daysleft):
+    (mgr, module), calls, outcomes = daysleft
+    start = _start_in(120)
+    # Given in UTC: DaysLeft must receive the Riyadh wall-clock date/time.
+    start_utc = start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M+00:00")
+    res = _call(mgr, action="log", start=start_utc, attendees="Khalid", topic="Q4 budget",
+                key_points=["we need 2 more hires", "highlight Q3 results"])
+    assert res["success"], res
+    meeting_id = res["meeting_id"]
+    assert res["confirmation"].endswith("\n📅 Added to DaysLeft")
+
+    post = calls[0]
+    assert (post["method"], post["url"]) == ("POST", "https://daysleft.example/api/tasks")
+    assert post["auth"] == f"Bearer {DAYSLEFT_KEY}" and post["timeout"] == 5
+    assert post["body"] == {
+        "title": "Meeting with Khalid", "date": start.strftime("%Y-%m-%d"),
+        "time": start.strftime("%H:%M"), "category": "Work", "priority": "high",
+        "description": "Topic: Q4 budget\nKey points: we need 2 more hires; highlight Q3 results\n"
+                       "Red flags: NOT MENTIONED",
+        "externalId": f"hermes-meeting-{meeting_id}"}
+
+    msg = module._cmd_cancel(str(meeting_id))
+    assert "Cancelled" in msg and msg.endswith("\n📅 Removed from DaysLeft")
+    delete = calls[1]
+    assert delete["method"] == "DELETE" and delete["auth"] == f"Bearer {DAYSLEFT_KEY}"
+    assert delete["url"] == f"https://daysleft.example/api/tasks/hermes-meeting-{meeting_id}"
+
+    # 404 on delete means already gone: still reported as removed.
+    other = _call(mgr, action="log", start=_start_in(60).strftime("%Y-%m-%dT%H:%M"))
+    assert calls[-1]["body"]["title"] == "Meeting"
+    outcomes.append(404)
+    assert module._cmd_cancel(str(other["meeting_id"])).endswith("📅 Removed from DaysLeft")
+
+
+def test_daysleft_failure_or_timeout_never_blocks_the_meeting(daysleft, caplog):
+    (mgr, module), calls, outcomes = daysleft
+    outcomes.append(TimeoutError("timed out"))
+    res = _call(mgr, action="log", start=_start_in(60).strftime("%Y-%m-%dT%H:%M"), attendees="Sara")
+    assert res["success"], res
+    assert res["confirmation"].endswith("\n⚠️ DaysLeft sync failed")
+    assert _jobs_for(res["meeting_id"]) != (None, None)
+
+    outcomes.append(500)
+    msg = module._cmd_cancel(str(res["meeting_id"]))
+    assert "Cancelled" in msg and msg.endswith("\n⚠️ DaysLeft removal failed")
+    assert _jobs_for(res["meeting_id"]) == (None, None)
+    assert len(calls) == 2
+    assert DAYSLEFT_KEY not in caplog.text
+
+
+def test_daysleft_skipped_silently_without_env_vars(meetings, monkeypatch):
+    import urllib.request
+    mgr, module = meetings
+    monkeypatch.delenv("DAYSLEFT_URL", raising=False)
+    monkeypatch.setenv("DAYSLEFT_API_KEY", DAYSLEFT_KEY)
+
+    def boom(*_a, **_kw):
+        raise AssertionError("DaysLeft must not be called without DAYSLEFT_URL")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    res = _call(mgr, action="log", start=_start_in(60).strftime("%Y-%m-%dT%H:%M"), attendees="Omar")
+    assert res["success"], res
+    assert res["confirmation"].endswith(f"/cancel {res['meeting_id']} to cancel")
+    msg = module._cmd_cancel(str(res["meeting_id"]))
+    assert "DaysLeft" not in msg
