@@ -1,11 +1,11 @@
-"""tact-meetings — Meeting Battle Cards on top of the existing cron scheduler.
+"""tact-meetings — meeting advance reminders on top of the existing cron scheduler.
 
 The model extracts the fields from the manager's message and calls the ``meeting`` tool; every
 reply the manager sees is formatted here, so a field the manager did not mention always reads
 ``NOT MENTIONED`` and is never filled in by the model.
 
 Each logged meeting becomes two one-shot, ``no_agent`` cron jobs (no LLM at fire time) delivered
-to the chat the meeting was logged from: the Battle Card 10 minutes before (or right away when the
+to the chat the meeting was logged from: the advance reminder 10 minutes before (or right away when the
 meeting is closer than that) and a short reminder at start time. Cron jobs already persist in
 ``<home>/cron/jobs.json`` and survive a restart; the meetings themselves live in
 ``<home>/meetings/meetings.db`` so ``/meetings`` and ``/cancel <id>`` can list and remove them.
@@ -114,17 +114,22 @@ def _fmt_day(dt: datetime, now: datetime, short: bool = False) -> str:
 
 
 def _bullets(items: List[str]) -> str:
-    return "\n".join(f"• {item}" for item in (items or [NOT_MENTIONED]))
+    return "\n".join(f"- {item}" for item in (items or [NOT_MENTIONED]))
 
 
-def battle_card(attendees: str, topic: str, red_flags: List[str], key_points: List[str],
-                minutes_left: int) -> str:
-    lead = f"Meeting in {minutes_left} min" if minutes_left >= 1 else "Meeting starting now"
-    return (f"⚔️ BATTLE CARD — {lead}\n"
+def _joined(items: List[str]) -> str:
+    return "; ".join(items) or NOT_MENTIONED
+
+
+def advance_reminder(attendees: str, starts_at: datetime, red_flags: List[str],
+                     key_points: List[str], minutes_left: int) -> str:
+    lead = (f"meeting in {minutes_left} minute{'' if minutes_left == 1 else 's'}"
+            if minutes_left >= 1 else "meeting starting now")
+    return (f"⏰ Reminder: {lead}\n"
             f"👥 With: {_or_missing(attendees)}\n"
-            f"📌 Topic: {_or_missing(topic)}\n"
-            f"🚩 Red Flags:\n{_bullets(red_flags)}\n"
-            f"🎯 Key Points to Deliver:\n{_bullets(key_points)}")
+            f"🕒 Time: {_fmt_time(starts_at)}\n"
+            f"🎯 Key points:\n{_bullets(key_points)}\n"
+            f"🚩 Red flags:\n{_bullets(red_flags)}")
 
 
 def start_reminder(attendees: str, topic: str, key_points: List[str]) -> str:
@@ -190,7 +195,8 @@ def log_meeting(start: str, attendees: Any = None, topic: Any = None, red_flags:
              json.dumps(points), now.isoformat())).lastrowid
     try:
         card_job = _schedule_message(
-            meeting_id, "card", battle_card(attendees_s, topic_s, flags, points, minutes_left), card_at)
+            meeting_id, "card", advance_reminder(attendees_s, starts_at, flags, points, minutes_left),
+            card_at)
         reminder_job = _schedule_message(
             meeting_id, "reminder", start_reminder(attendees_s, topic_s, points), reminder_at)
     except Exception as exc:
@@ -201,14 +207,16 @@ def log_meeting(start: str, attendees: Any = None, topic: Any = None, red_flags:
         con.execute("UPDATE meetings SET card_job_id = ?, reminder_job_id = ? WHERE id = ?",
                     (card_job, reminder_job, meeting_id))
 
-    card_when = ("Battle Card sending now (meeting is less than 10 minutes away)" if card_now
-                 else f"Battle Card at {_fmt_time(card_at)}")
+    advance = ("advance reminder sending now (meeting is less than 10 minutes away)" if card_now
+               else f"10 min before ({_fmt_time(card_at)})")
     confirmation = (
-        f"✅ Logged: {_fmt_day(starts_at, now)}, {_fmt_time(starts_at)} with {_or_missing(attendees_s)}"
-        f" — {_or_missing(topic_s)}.\n"
-        f"🚩 Red flags: {'; '.join(flags) or NOT_MENTIONED}\n"
-        f"🎯 Key points: {'; '.join(points) or NOT_MENTIONED}\n"
-        f"{card_when}, reminder at {_fmt_time(reminder_at)}. (ID {meeting_id} — /cancel {meeting_id} to cancel)")
+        "✅ Logged\n"
+        f"👥 With: {_or_missing(attendees_s)}\n"
+        f"🕒 Time: {_fmt_day(starts_at, now)}, {_fmt_time(starts_at)}\n"
+        f"🎯 Key points: {_joined(points)}\n"
+        f"🚩 Red flags: {_joined(flags)}\n"
+        f"⏰ Reminders: {advance} and at start ({_fmt_time(reminder_at)}). "
+        f"ID {meeting_id}, /cancel {meeting_id} to cancel")
     return {"success": True, "meeting_id": meeting_id, "confirmation": confirmation}
 
 
@@ -264,7 +272,7 @@ def cancel_meeting(meeting_id: Any, any_chat: bool = False) -> Dict[str, Any]:
     dt = datetime.fromisoformat(row["starts_at"]).astimezone(TZ)
     return {"success": True, "message":
             f"❌ Cancelled meeting #{meeting_id} ({_fmt_day(dt, datetime.now(TZ), short=True)}, "
-            f"{_fmt_time(dt)} with {_or_missing(row['attendees'])}). Its Battle Card and reminder are removed."}
+            f"{_fmt_time(dt)} with {_or_missing(row['attendees'])}). Its advance reminder and start reminder are removed."}
 
 
 # -- tool + slash commands ---------------------------------------------------------------------
@@ -272,7 +280,7 @@ def cancel_meeting(meeting_id: Any, any_chat: bool = False) -> Dict[str, Any]:
 MEETING_SCHEMA = {
     "name": "meeting",
     "description": (
-        "Log an upcoming meeting and schedule its Battle Card (10 min before) and start-time "
+        "Log an upcoming meeting and schedule its advance reminder (10 min before) and start-time "
         "reminder, or list/cancel logged meetings. Use this instead of cronjob for meetings. "
         "Pass ONLY what the manager said; leave any field they did not mention empty, never guess. "
         "If the date or time is missing or unclear, do not call log: ask the manager first. "
@@ -322,7 +330,7 @@ def _cmd_cancel(raw_args: str) -> str:
 def register(ctx) -> None:
     ctx.register_tool(name="meeting", toolset="meetings", schema=MEETING_SCHEMA,
                       handler=_handle_meeting, emoji="⚔️",
-                      description="Log meetings with a Battle Card and reminder")
+                      description="Log meetings with an advance reminder and a start reminder")
     ctx.register_command("meetings", _cmd_meetings, description="List upcoming meetings")
     ctx.register_command("cancel", _cmd_cancel, description="Cancel a logged meeting",
                          args_hint="<id>")

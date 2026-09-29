@@ -1,4 +1,4 @@
-"""tact-meetings: a logged meeting becomes a Battle Card + start reminder in the cron store.
+"""tact-meetings: a logged meeting becomes an advance reminder + start reminder in the cron store.
 
 Loads the bundled plugin through the real ``PluginManager`` against a temp HERMES_HOME, dispatches
 the ``meeting`` tool through the registry, and runs the generated job scripts with cron's own
@@ -71,10 +71,14 @@ def test_logged_meeting_schedules_card_before_and_reminder_at_start(meetings):
         assert job["origin"]["platform"] == "telegram" and job["origin"]["chat_id"] == "4242"
 
     card_text = _script_output(card)
-    assert card_text.startswith("⚔️ BATTLE CARD — Meeting in 10 min")
-    assert "👥 With: Khalid" in card_text and "• avoid committing to dates" in card_text
+    assert card_text.startswith("⏰ Reminder: meeting in 10 minutes\n👥 With: Khalid\n")
+    assert "- avoid committing to dates" in card_text and "BATTLE CARD" not in card_text
     assert _script_output(reminder).endswith("Top priority: we need 2 more hires")
-    assert "Khalid" in res["confirmation"] and "NOT MENTIONED" not in res["confirmation"]
+    confirmation = res["confirmation"]
+    assert confirmation.startswith("✅ Logged\n👥 With: Khalid\n🕒 Time: ")
+    assert "🎯 Key points: we need 2 more hires; highlight Q3 results" in confirmation
+    assert "NOT MENTIONED" not in confirmation
+    assert confirmation.endswith(f"/cancel {res['meeting_id']} to cancel")
 
 
 def test_missing_fields_say_not_mentioned_and_missing_time_logs_nothing(meetings):
@@ -84,11 +88,12 @@ def test_missing_fields_say_not_mentioned_and_missing_time_logs_nothing(meetings
     card, reminder = _jobs_for(res["meeting_id"])
     card_text = _script_output(card)
 
-    assert "📌 Topic: NOT MENTIONED" in card_text
-    assert "🚩 Red Flags:\n• NOT MENTIONED" in card_text
-    assert "🎯 Key Points to Deliver:\n• NOT MENTIONED" in card_text
+    assert "🎯 Key points:\n- NOT MENTIONED" in card_text
+    assert "🚩 Red flags:\n- NOT MENTIONED" in card_text
+    assert "about NOT MENTIONED" in _script_output(reminder)
     assert _script_output(reminder).endswith("Top priority: NOT MENTIONED")
-    assert res["confirmation"].count("NOT MENTIONED") == 3  # topic, red flags, key points
+    assert "🎯 Key points: NOT MENTIONED" in res["confirmation"]
+    assert "🚩 Red flags: NOT MENTIONED" in res["confirmation"]
 
     from cron.jobs import list_jobs
     before = len(list_jobs(include_disabled=True))
@@ -96,7 +101,7 @@ def test_missing_fields_say_not_mentioned_and_missing_time_logs_nothing(meetings
     assert len(list_jobs(include_disabled=True)) == before
 
 
-def test_meeting_under_ten_minutes_sends_card_now(meetings):
+def test_meeting_under_ten_minutes_sends_advance_reminder_now(meetings):
     mgr, _ = meetings
     start = _start_in(6)
     res = _call(mgr, action="log", start=start.strftime("%Y-%m-%dT%H:%M"), attendees="Sara")
@@ -105,7 +110,8 @@ def test_meeting_under_ten_minutes_sends_card_now(meetings):
 
     assert datetime.fromisoformat(card["next_run_at"]) <= datetime.now(RIYADH)
     assert datetime.fromisoformat(reminder["next_run_at"]) == start
-    assert "sending now" in res["confirmation"]
+    assert "advance reminder sending now" in res["confirmation"]
+    assert _script_output(card).startswith("⏰ Reminder: meeting in 6 minutes")
 
 
 def test_cancel_removes_jobs_and_silences_the_meeting(meetings):

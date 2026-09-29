@@ -1,6 +1,6 @@
 name: tact-meetings
 version: "0.1.0"
-description: "Meeting Battle Cards: log a meeting (attendees, topic, red flags, key points), get a Battle Card 10 minutes before and a reminder at start time through the existing cron scheduler. /meetings lists upcoming meetings, /cancel <id> removes one."
+description: "Meeting reminders: log a meeting (attendees, topic, red flags, key points), get an advance reminder 10 minutes before and a reminder at start time through the existing cron scheduler. /meetings lists upcoming meetings, /cancel <id> removes one."
 author: "Tact"
 provides_tools:
   - meeting
