@@ -576,3 +576,83 @@ def test_broken_json_is_retried_then_brief_retry_rewrites_it_from_the_transcript
     assert SECRET_LINE in json.dumps(calls[-1]["messages"])  # rebuilt from the saved transcript
     assert mod.store.get_meeting(1, "telegram", CHAT)["status"] == "pending"
     assert retry() == ["Meeting #1 already has a brief. Show it with /brief 1."]
+
+
+class ScriptedLlm:
+    """Answers each structured call from ``replies[schema_name]`` and records the calls."""
+
+    def __init__(self, **replies):
+        self.replies, self.calls = replies, []
+
+    async def acomplete_structured(self, **kw):
+        self.calls.append(kw)
+        reply = self.replies[kw["schema_name"]]
+        return SimpleNamespace(parsed=reply, text=json.dumps(reply, ensure_ascii=False), finish_reason="stop")
+
+
+LONG_AR = ("قررنا خفض ميزانية السفر عشرين بالمئة وموافقين على الإطلاق يوم خمسة عشر نوفمبر. " * 30)
+
+
+def test_decisions_and_open_issues_survive_objects_nested_lists_and_other_keys(recorder):
+    fmt = recorder.brief
+    _, brief, _ = fmt.normalize({
+        "summary": "اجتماع المبيعات",
+        "decisions": [{"decision": "خفض ميزانية السفر 20%"}, [{"text": "الإطلاق في 15 نوفمبر"}]],
+        "open_questions": [["خصم 15% للعميل"], {"topic": "تأخير التصميم", "status": "pending"}]})
+    assert brief == {"summary": ["اجتماع المبيعات"],
+                     "decisions": ["خفض ميزانية السفر 20%", "الإطلاق في 15 نوفمبر"],
+                     "open_issues": ["خصم 15% للعميل", "تأخير التصميم — pending"]}
+    _, brief, _ = fmt.normalize({"القرارات": ["خفض السفر"], "القضايا_المفتوحة": [{"القضية": "توظيف مطور"}]})
+    assert brief["decisions"] == ["خفض السفر"] and brief["open_issues"] == ["توظيف مطور"]
+
+
+def test_empty_decisions_and_open_issues_get_one_followup_call(recorder, caplog):
+    fmt = recorder.brief
+    caplog.set_level(logging.INFO)
+    main = {"language": "ar", "summary": ["قررنا خفض السفر"], "decisions": [], "open_issues": [], "tasks": []}
+    llm = ScriptedLlm(meeting_brief=main, meeting_decisions={
+        "decisions": ["خفض ميزانية السفر 20%", "الإطلاق في 15 نوفمبر"], "open_issues": [{"issue": "توظيف مطور"}]})
+    _, brief, _ = asyncio.run(fmt.analyze(llm, LONG_AR))
+    assert brief["decisions"] == ["خفض ميزانية السفر 20%", "الإطلاق في 15 نوفمبر"]
+    assert brief["open_issues"] == ["توظيف مطور"]
+    assert [c["schema_name"] for c in llm.calls] == ["meeting_brief", "meeting_decisions"]
+    # Counts, key names and item types are logged; the meeting's content is not.
+    assert "brief counts: decisions=2 open_issues=1 tasks=0 with_deadline=0 follow-ups=decisions" in caplog.text
+    assert "decisions=list[empty]" in caplog.text and "open_issues=list[dictx1]{issue}" in caplog.text
+    assert "خفض" not in caplog.text and "توظيف" not in caplog.text
+    # A short meeting may genuinely decide nothing: no follow-up call then.
+    llm = ScriptedLlm(meeting_brief=main)
+    asyncio.run(fmt.analyze(llm, "اجتماع قصير"))
+    assert len(llm.calls) == 1
+
+
+def test_tasks_accept_other_keys_and_deadlines_glued_to_the_task(recorder):
+    _, _, tasks = recorder.brief.normalize({"tasks": [
+        {"description": "Send the deck", "assignee": "Omar", "due_date": "Tuesday"},
+        {"المهمة": "مراجعة العقد", "المسؤول": "أحمد", "الموعد_النهائي": "يوم الأحد القادم"},
+        {"task": "تجهيز العرض التقديمي لشركة النخبة وترتيب اجتماع معهم قبل نهاية الأسبوع القادم", "owner": "سارة"},
+        {"action": "إرسال التقرير", "responsible": ["أحمد", "عمر"], "when": "بكرة"},
+        "مراجعة خطة الأسبوع"]})
+    assert [(t["person"], t["task"], t["deadline"], t["candidates"]) for t in tasks] == [
+        ("Omar", "Send the deck", "Tuesday", []),
+        ("أحمد", "مراجعة العقد", "يوم الأحد القادم", []),
+        ("سارة", "تجهيز العرض التقديمي لشركة النخبة وترتيب اجتماع معهم", "قبل نهاية الأسبوع القادم", []),
+        ("", "إرسال التقرير", "بكرة", ["أحمد", "عمر"]),  # two owners named: unclear, not guessed
+        ("", "مراجعة خطة الأسبوع", "", [])]
+
+
+def test_missing_deadlines_get_one_followup_call(recorder):
+    fmt = recorder.brief
+    main = {"language": "ar", "summary": ["x"], "decisions": ["d"],
+            "tasks": [{"owner": "أحمد", "task": "إرسال التقرير"}, {"owner": "عمر", "task": "تنظيم الأرشيف"},
+                      {"owner": "سارة", "task": "حجز القاعة"}]}
+    llm = ScriptedLlm(meeting_brief=main, meeting_deadlines={"deadlines": [
+        {"n": 1, "deadline": "بكرة"}, {"n": 2, "deadline": ""}, {"n": 3, "deadline": "يوم الثلاثاء"}]})
+    _, _, tasks = asyncio.run(fmt.analyze(llm, "يا أحمد أرسل التقرير بكرة، وسارة احجزي القاعة يوم الثلاثاء"))
+    assert [t["deadline"] for t in tasks] == ["بكرة", "", "يوم الثلاثاء"]
+    assert [c["schema_name"] for c in llm.calls] == ["meeting_brief", "meeting_deadlines"]
+    assert "1. أحمد — إرسال التقرير" in llm.calls[1]["input"][0]["text"]
+    # No deadline words in the meeting: nothing to recover, no follow-up call.
+    llm = ScriptedLlm(meeting_brief=main)
+    asyncio.run(fmt.analyze(llm, "ناقشنا تنظيم الأرشيف وحجز القاعة"))
+    assert len(llm.calls) == 1
