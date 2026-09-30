@@ -67,12 +67,13 @@ BRIEF_FAILED = "⚠️ Meeting #{id}: the brief could not be written. Send /brie
 
 _LLM: Any = None  # ctx.llm, bound in register()
 _RUNNING: set = set()  # background jobs (kept referenced until done)
-# (platform, chat_id) -> (meeting_id, task position, expiry) after the manager taps ✏️
-_awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, float]] = {}
+# (platform, chat_id) -> (meeting_id, task number, field, expiry) after ✏️ and a field button
+_awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, str, float]] = {}
 # (platform, chat_id) -> expiry after a bare /minutes: the next audio/voice is a recording
 _minutes_armed: Dict[Tuple[str, str], float] = {}
-_BUTTON_RE = re.compile(r"^rec:([acer]):(\d+):(\d+)$")
-_BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove"}
+_BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntd]))?$")
+_BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back"}
+_BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline"}
 _RETRY_RE = re.compile(r"^#?(\d+)\s+retry$", re.IGNORECASE)
 _SHOW_RE = re.compile(r"^#?(\d+)$")
 
@@ -243,10 +244,11 @@ def _text_replies(platform: str, chat_id: str, text: str) -> Optional[confirm.Ou
     """The outcome when *text* answers a pending confirmation in this chat, else None (not ours)."""
     command = confirm.parse_command(text)
     awaiting = _awaiting_edit.pop((platform, chat_id), None)
-    if command is None and awaiting and awaiting[2] > time.monotonic():
+    if command is None and awaiting and awaiting[3] > time.monotonic():
         meeting = store.get_meeting(awaiting[0], platform, chat_id)
         if meeting is not None:
-            return confirm.apply(meeting, "edit", awaiting[1], text)
+            # The whole message is the new value of the field the manager chose; never parsed.
+            return confirm.set_field(meeting, awaiting[1], awaiting[2], text)
     if command is None:
         return None
     meeting = store.latest_pending(platform, chat_id)
@@ -320,10 +322,19 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
     meeting = store.get_meeting(meeting_id, platform, chat_id)
     if meeting is None or meeting["user_id"] != user_id:
         return None, "Not allowed."
-    if action == "edit" and meeting["status"] == "pending":
-        _awaiting_edit[(platform, chat_id)] = (meeting_id, position, time.monotonic() + EDIT_TTL_SECONDS)
+    if action in ("edit", "field", "back") and meeting["status"] == "pending":
+        if action == "edit":  # the card offers Name / Task / Deadline / Back
+            return confirm.Outcome(meeting_id, changed=[position], picker=position), ""
+        if action == "back":  # normal buttons again
+            _awaiting_edit.pop((platform, chat_id), None)
+            return confirm.Outcome(meeting_id, changed=[position]), ""
+        field_name = _BUTTON_FIELDS[m.group(4) or "n"]
+        _awaiting_edit[(platform, chat_id)] = (meeting_id, position, field_name,
+                                               time.monotonic() + EDIT_TTL_SECONDS)
         lang = fmt.lang_of(meeting["language"])
-        return confirm.Outcome(meeting_id, messages=[confirm.EDIT_HELP[lang].format(n=position)]), ""
+        return confirm.Outcome(meeting_id, messages=[confirm.FIELD_PROMPT[lang][field_name].format(n=position)]), ""
+    if action in ("field", "back"):
+        action = "edit"  # meeting no longer pending: apply() says so
     return confirm.apply(meeting, action, position), ""
 
 
@@ -339,7 +350,7 @@ def _telegram_handlers(app: Any, adapter: Any) -> None:
         outcome, toast = handle_button(query.data, "telegram", chat_id, str(query.from_user.id))
         await query.answer(toast or None)
         if outcome is not None:
-            position = int(query.data.rsplit(":", 1)[1])
+            position = int(query.data.split(":")[3])
             await present.show_changes(adapter, "telegram", chat_id, outcome,
                                        pressed={position: query.message.message_id})
 
@@ -400,9 +411,12 @@ def _cmd_brief(raw_args: str) -> str:
         return status
     meeting = store.get_meeting(meeting_id, platform, chat_id)
     lang, tasks = fmt.lang_of(meeting["language"]), store.tasks_for(meeting_id)
+    pending = [t for t in tasks if t["status"] == "pending"]
     text = fmt.brief_text(meeting_id, meeting["created_at"], lang, json.loads(meeting["brief"]), len(tasks), False)
-    if tasks:
-        text += "\n\n" + fmt.combined_text(tasks, lang, with_help=meeting["status"] == "pending")
+    if len(pending) < len(tasks):
+        text += "\n\n" + fmt.final_text(meeting_id, lang, tasks)
+    if pending:
+        text += "\n\n" + fmt.combined_text(pending, len(tasks), lang)
     return text
 
 

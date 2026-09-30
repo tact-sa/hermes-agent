@@ -204,7 +204,7 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
     assert brief.endswith("\n\n📋 Tasks (3) in the following messages") and "Send the Q3 budget" not in brief
     (card1, m1), (card2, m2), (card3, _), (all_text, all_markup) = gw.adapter._bot.messages.values()
     assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday"
-    assert _buttons(m1) == [[("✅ Confirm", "rec:c:1:1"), ("✏️ Edit", "rec:e:1:1"), ("❌ Remove", "rec:r:1:1")]]
+    assert _buttons(m1) == [[("✅ Confirm", "rec:c:1:1"), ("✏️ Edit", "rec:e:1:1"), ("❌ Cancel", "rec:r:1:1")]]
     assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED"
     assert card3.startswith("📋 Task 3 of 3\n👤 Ahmad")
     assert _buttons(all_markup) == [[("✅ Confirm all (3)", "rec:a:1:0")]] and "confirm 2" in all_text
@@ -274,15 +274,17 @@ def test_unclear_owner_is_flagged_and_spellings_merge_into_one_person(recorder):
         assert [t["person"] for t in tasks] == [owner, "", owner]
         rows = [dict(t, position=i, status="confirmed") for i, t in enumerate(tasks, 1)]
         assert f"👤 {unclear}\n📌 Call the vendor\n📅 {missing}" in fmt.task_card(rows[1], 3, language)
-        # The final summary: grouped by person, the task's own number, no brackets; unclear owners last.
-        title = "✅ Confirmed tasks — Meeting #1" if lang == "en" else "✅ المهام المؤكدة — اجتماع #1"
+        # The final summary: one labelled block per task under its own number; no brackets.
+        title, name, task, due = (("✅ Confirmed tasks — Meeting 1", "Name", "Task", "Deadline") if lang == "en"
+                                  else ("✅ المهام المؤكدة — اجتماع 1", "الاسم", "المهمة", "الموعد"))
         assert fmt.final_text(1, language, rows) == (
-            f"{title}\n\n👤 {owner}\n1. Send the Q3 budget — Sunday\n3. Book the launch venue — {missing}"
-            f"\n\n👤 {unclear.split(':')[0]}\n2. Call the vendor — {missing}")
+            f"{title}\n\n1.\n👤 {name}: {owner}\n📌 {task}: Send the Q3 budget\n📅 {due}: Sunday"
+            f"\n\n2.\n👤 {name}: {unclear.rstrip('?؟')}\n📌 {task}: Call the vendor\n📅 {due}: {missing}"
+            f"\n\n3.\n👤 {name}: {owner}\n📌 {task}: Book the launch venue\n📅 {due}: {missing}")
     assert fmt.brief_text(1, "2026-09-30T10:00:00", "ar", brief, 3).endswith("📋 المهام (3) في الرسائل التالية")
 
 
-def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkeypatch):
+def test_text_replies_edit_labelled_fields_and_cancel(recorder, monkeypatch):
     mod = recorder
     store = mod.store
     language, brief, tasks = mod.brief.normalize(ANALYSIS)
@@ -295,19 +297,31 @@ def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkey
         assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
         return gw.adapter.sent
 
-    # No task cards to edit on this platform: each change is confirmed with a short text reply.
-    assert reply("remove 3") == ["❌ Task 3 removed. (2 still to confirm)"]
-    assert "👤 Omar\n📌 Call the vendor\n📅 Sunday" in reply("edit 2: Omar, due Sunday")[0]
-    assert reply("confirm 1") == ["✅ Task 1 confirmed. (1 still to confirm)"]
-    # ✏️ then a plain message edits that task.
-    outcome, _ = mod.handle_button(f"rec:e:{meeting_id}:2", "telegram", CHAT, MANAGER)
-    assert "task 2" in outcome.messages[0]
-    assert "📌 Call the vendor about prices" in reply("task: Call the vendor about prices")[0]
+    def task(n):
+        return store.tasks_for(meeting_id)[n - 1]
 
-    assert reply("تأكيد الكل") == [
-        f"✅ Confirmed tasks — Meeting #{meeting_id}\n\n👤 Ahmad\n1. Send the Q3 budget — Sunday"
-        "\n\n👤 Omar\n2. Call the vendor about prices — Sunday"]
-    assert [t["status"] for t in store.tasks_for(meeting_id)] == ["confirmed", "confirmed", "removed"]
+    # No task cards to edit on this platform: each change is confirmed with a short text reply.
+    assert reply("إلغاء 3") == ["❌ Task 3 cancelled. (2 still to confirm)"]
+    # Without a label nothing is guessed: the manager is asked which field.
+    assert "Which field of task 2?" in reply("edit 2: Omar, due Sunday")[0]
+    assert (task(2)["person"], task(2)["deadline"]) == ("", "")
+    # Labelled, any order, several fields; a name turns the unclear task into that person's.
+    assert "👤 Omar\n📌 Call the vendor\n📅 Thursday" in reply("edit 2: deadline: Thursday, name: Omar")[0]
+    assert task(2)["candidates"] == [] and task(2)["person_key"] == "omar"
+    reply("تعديل 1: الموعد: يوم الخميس، والمهمة: إرسال الميزانية")
+    assert (task(1)["person"], task(1)["task"], task(1)["deadline"]) == ("Ahmad", "إرسال الميزانية", "يوم الخميس")
+    assert reply("confirm 1") == ["✅ Task 1 confirmed. (1 still to confirm)"]
+
+    # "حذف" (the old wording) still cancels; with nothing pending the final summary follows.
+    cancelled, final = reply("حذف 2")
+    assert cancelled == "❌ Task 2 cancelled."
+    assert final == (
+        f"✅ Confirmed tasks — Meeting {meeting_id}\n\n"
+        "1.\n👤 Name: Ahmad\n📌 Task: إرسال الميزانية\n📅 Deadline: يوم الخميس\n\n"
+        "❌ Cancelled tasks\n\n"
+        "2.\n👤 Name: Omar\n📌 Task: Call the vendor\n📅 Deadline: Thursday\n\n"
+        "3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue\n📅 Deadline: NOT MENTIONED")
+    assert [t["status"] for t in store.tasks_for(meeting_id)] == ["confirmed", "removed", "removed"]
     assert store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
     # Nothing pending any more: confirmation words are ordinary messages again.
     later = _event(text="confirm all", message_type="TEXT")
@@ -315,9 +329,19 @@ def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkey
 
     listing = mod._cmd_recordings("")
     assert f"#{meeting_id}" in listing and "✅ confirmed" in listing
-    shown = mod._cmd_brief(str(meeting_id))
-    assert "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed" in shown
-    assert "📋 Task 3 of 3" in shown and "❌ Removed" in shown and "[#" not in shown
+    shown = mod._cmd_brief(str(meeting_id))  # handled tasks: the same block layout
+    assert final in shown and "📋 Task 1 of 3" not in shown and "[#" not in shown
+
+
+def test_labelled_edit_text_is_split_by_label_only(recorder):
+    parse = recorder.confirm.parse_labelled
+    assert parse("name: Omar, deadline: Thursday") == {"person": "Omar", "deadline": "Thursday"}
+    assert parse("الاسم: عمر، الموعد: الخميس") == {"person": "عمر", "deadline": "الخميس"}
+    assert parse("Due: end of month; Task: send the report, then call") == {
+        "deadline": "end of month", "task": "send the report, then call"}
+    assert parse("الاسم: احمد او عمر (يحدد لاحقا)") == {"person": "احمد او عمر (يحدد لاحقا)"}
+    for unlabelled in ("يوم الخميس", "Omar, due Sunday", "call Omar: urgent"):
+        assert parse(unlabelled) == {}, unlabelled
 
 
 def _seed(mod, n_tasks=3):
@@ -352,29 +376,66 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
         return toasts
 
     def reply(text):
+        gw.adapter.sent.clear()
         assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
+        return gw.adapter.sent
+
+    def task(n):
+        return mod.store.tasks_for(meeting_id)[n - 1]
+
+    normal = [[("✅ Confirm", f"rec:c:{meeting_id}:2"), ("✏️ Edit", f"rec:e:{meeting_id}:2"),
+               ("❌ Cancel", f"rec:r:{meeting_id}:2")]]
+    picker = [[("👤 Name", f"rec:f:{meeting_id}:2:n"), ("📌 Task", f"rec:f:{meeting_id}:2:t"),
+               ("📅 Deadline", f"rec:f:{meeting_id}:2:d")], [("↩️ Back", f"rec:b:{meeting_id}:2")]]
 
     gw.adapter.sent.clear()
-    reply("حذف 3")  # a text reply edits that task's card, like its button would
-    text, markup = bot.messages[card3]
-    assert text.endswith("\n\n❌ Removed") and markup is None
-    assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (2)", f"rec:a:{meeting_id}:0")]]
+    press(f"rec:e:{meeting_id}:2", card2)  # ✏️: the card itself offers the fields
+    assert _buttons(bot.messages[card2][1]) == picker and gw.adapter.sent == []
+    # Each field button: the next message replaces only that field, exactly as typed.
+    for code, prompt, value, field in (
+            ("n", "Send the new name for task 2", "عمر (يحدد لاحقا)", "person"),
+            ("d", "Send the new deadline for task 2", "يوم الخميس", "deadline"),
+            ("t", "Send the new task text for task 2", "الاسم: احمد او عمر (يحدد لاحقا)", "task")):
+        before = task(2)
+        press(f"rec:e:{meeting_id}:2", card2)
+        press(f"rec:f:{meeting_id}:2:{code}", card2)
+        assert gw.adapter.sent == [prompt]
+        assert reply(f"  {value} ") == []  # the card is edited instead of a new message
+        after = task(2)
+        assert after[field] == value
+        assert {k: after[k] for k in ("person", "task", "deadline") if k != field} == \
+            {k: before[k] for k in ("person", "task", "deadline") if k != field}
+        assert _buttons(bot.messages[card2][1]) == normal
+    assert bot.messages[card2][0] == ("📋 Task 2 of 3\n👤 عمر (يحدد لاحقا)\n📌 الاسم: احمد او عمر (يحدد لاحقا)"
+                                      "\n📅 يوم الخميس")
+    assert task(2)["candidates"] == []  # the unclear task now belongs to that person
+    # ↩️ puts the normal buttons back and nothing is waiting for a value.
+    press(f"rec:e:{meeting_id}:2", card2)
+    press(f"rec:b:{meeting_id}:2", card2)
+    assert _buttons(bot.messages[card2][1]) == normal
+    hello = _event(text="hello", message_type="TEXT")
+    assert _dispatch(mod, gw, hello) is hello
 
-    assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."] and bot.edits == [card3, all_id]
+    assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."]
     press(f"rec:c:{meeting_id}:1", card1)
-    text, markup = bot.messages[card1]
-    assert text == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed" and markup is None
+    assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed", None)
+    reply("إلغاء 3")  # a text reply edits that task's card, like its button would
+    assert bot.messages[card3][0].endswith("\n\n❌ Cancelled") and bot.messages[card3][1] is None
+    assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (1)", f"rec:a:{meeting_id}:0")]]
 
-    reply("edit 2: Omar, due Sunday")  # still pending: new text, buttons stay
-    text, markup = bot.messages[card2]
-    assert text == "📋 Task 2 of 3\n👤 Omar\n📌 Call the vendor\n📅 Sunday" and len(_buttons(markup)[0]) == 3
-    assert gw.adapter.sent == []  # every change so far edited a message instead of sending one
-
+    gw.adapter.sent.clear()
     press(f"rec:a:{meeting_id}:0", all_id)
     assert bot.messages[card2][0].endswith("✅ Confirmed") and bot.messages[card2][1] is None
     assert bot.messages[all_id] == ("✅ All tasks handled.", None)
-    assert gw.adapter.sent == [f"✅ Confirmed tasks — Meeting #{meeting_id}\n\n👤 Ahmad\n1. Send the Q3 budget — Sunday"
-                               "\n\n👤 Omar\n2. Call the vendor — Sunday"]
+    (final,) = gw.adapter.sent
+    assert final.startswith(f"✅ Confirmed tasks — Meeting {meeting_id}\n\n1.\n👤 Name: Ahmad\n")
+    assert "\n\n❌ Cancelled tasks\n\n3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue" in final
+    # Arabic meetings get Arabic buttons, with "إلغاء" for cancel.
+    ar_picker = mod.present._picker_markup(meeting_id, 2, "ar")
+    assert [b for b, _ in _buttons(ar_picker)[0]] + [b for b, _ in _buttons(ar_picker)[1]] == [
+        "👤 الاسم", "📌 المهمة", "📅 الموعد", "↩️ رجوع"]
+    assert [b for b, _ in _buttons(mod.present._card_markup(meeting_id, dict(task(1), status="pending"), "ar"))[0]] == [
+        "✅ تأكيد", "✏️ تعديل", "❌ إلغاء"]
 
 
 def test_more_than_fifteen_tasks_go_in_one_list_with_text_replies(recorder, telegram_stub):
