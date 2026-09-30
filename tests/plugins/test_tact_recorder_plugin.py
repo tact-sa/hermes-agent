@@ -656,3 +656,86 @@ def test_missing_deadlines_get_one_followup_call(recorder):
     llm = ScriptedLlm(meeting_brief=main)
     asyncio.run(fmt.analyze(llm, "ناقشنا تنظيم الأرشيف وحجز القاعة"))
     assert len(llm.calls) == 1
+
+
+def test_assignments_filed_as_decisions_become_tasks(recorder):
+    _, brief, tasks = recorder.brief.normalize({
+        "language": "ar", "summary": ["x"],
+        "people": [{"name": "خالد"}, {"name": "عمر"}, {"name": "سارة"}],
+        "decisions": ["تكليف خالد بإعداد تقرير المبيعات قبل يوم الخميس", "خفض ميزانية السفر 20%",
+                      "تكليف عمر بالتواصل مع شركة النخبة بكرة", "تكليف سارة بإرسال الدعوات"],
+        "tasks": [{"owner": "", "owner_candidates": ["سارة", "عمر"], "task": "سارة: إرسال الدعوات"},
+                  {"owner": "", "owner_candidates": ["خالد", "عمر"], "task": "الاتصال بالمورد"}]})
+    assert brief["decisions"] == ["خفض ميزانية السفر 20%"]
+    assert [(t["person"], t["task"], t["deadline"], t["candidates"]) for t in tasks] == [
+        ("سارة", "إرسال الدعوات", "", []),  # the text names its one owner: not unclear
+        ("", "الاتصال بالمورد", "", ["خالد", "عمر"]),  # genuinely unclear stays unclear
+        ("خالد", "إعداد تقرير المبيعات", "قبل يوم الخميس", []),
+        ("عمر", "التواصل مع شركة النخبة", "بكرة", [])]  # "تكليف سارة ..." was already task 1
+    _, brief, tasks = recorder.brief.normalize({
+        "people": [{"name": "Omar"}], "tasks": [],
+        "decisions": ["Omar will send the deck by Tuesday", "Launch moves to May", "Task force created"]})
+    assert brief["decisions"] == ["Launch moves to May", "Task force created"]
+    assert [(t["person"], t["task"], t["deadline"]) for t in tasks] == [("Omar", "send the deck", "by Tuesday")]
+
+
+class RoutedLlm(ScriptedLlm):
+    """ScriptedLlm whose calls can fail for one model (as an unavailable OpenRouter model would)."""
+
+    def __init__(self, broken_model=None, **replies):
+        super().__init__(**replies)
+        self.broken_model = broken_model
+
+    async def acomplete_structured(self, **kw):
+        if kw.get("model") and kw["model"] == self.broken_model:
+            self.calls.append(kw)
+            raise RuntimeError("model unavailable")
+        return await super().acomplete_structured(**kw)
+
+
+GEMINI = "google/gemini-3.8-flash"
+GAPPY = {"language": "ar", "summary": ["x"], "decisions": [], "open_issues": [],
+         "tasks": [{"owner": "أحمد", "task": "إرسال التقرير"}]}
+GAPPY_TRANSCRIPT = LONG_AR + " يا أحمد أرسل التقرير بكرة"
+
+
+def test_brief_model_writes_the_brief_and_its_follow_ups(recorder):
+    import hermes_yaml as yaml
+    managed = yaml.safe_load((REPO_ROOT / "tact" / "managed-config.yaml").read_text())
+    # The deployment sends only the brief to its own model, which the plugin is trusted to choose.
+    assert managed["tact_recorder"]["brief_model"]
+    assert managed["plugins"]["entries"]["tact-recorder"]["llm"]["allow_model_override"] is True
+
+    llm = RoutedLlm(meeting_brief=GAPPY, meeting_decisions={"decisions": ["d"], "open_issues": []},
+                    meeting_deadlines={"deadlines": [{"n": 1, "deadline": "بكرة"}]})
+    _, brief, tasks = asyncio.run(recorder.brief.analyze(llm, GAPPY_TRANSCRIPT, model=GEMINI))
+    assert [c["schema_name"] for c in llm.calls] == ["meeting_brief", "meeting_decisions", "meeting_deadlines"]
+    assert all(c["model"] == GEMINI for c in llm.calls)
+    assert brief["decisions"] == ["d"] and tasks[0]["deadline"] == "بكرة"
+
+    # The strict retry goes to the brief model too.
+    llm = RoutedLlm(meeting_brief=GAPPY)
+    replies = iter([SimpleNamespace(parsed=None, text="not json", finish_reason="stop"),
+                    SimpleNamespace(parsed=dict(GAPPY, decisions=["d"], tasks=[]), text="", finish_reason="stop")])
+
+    async def flaky(**kw):
+        llm.calls.append(kw)
+        return next(replies)
+    llm.acomplete_structured = flaky
+    asyncio.run(recorder.brief.analyze(llm, "short", model=GEMINI))
+    assert len(llm.calls) == 2 and all(c["model"] == GEMINI for c in llm.calls)
+    assert recorder.brief.STRICT_RETRY in llm.calls[1]["instructions"]
+
+
+def test_a_failing_brief_model_falls_back_to_the_main_model(recorder, caplog):
+    caplog.set_level(logging.INFO)
+    llm = RoutedLlm(broken_model=GEMINI, meeting_brief=GAPPY,
+                    meeting_decisions={"decisions": ["d"], "open_issues": []},
+                    meeting_deadlines={"deadlines": [{"n": 1, "deadline": "بكرة"}]})
+    _, brief, tasks = asyncio.run(recorder.brief.analyze(llm, GAPPY_TRANSCRIPT, model=GEMINI))
+    assert [(c["schema_name"], c.get("model")) for c in llm.calls] == [
+        ("meeting_brief", GEMINI), ("meeting_brief", None),  # one failure, then the main model for the rest
+        ("meeting_decisions", None), ("meeting_deadlines", None)]
+    assert brief["decisions"] == ["d"] and tasks[0]["deadline"] == "بكرة"
+    assert f"brief model {GEMINI} failed (RuntimeError); falling back to the main chat model" in caplog.text
+    assert "التقرير" not in caplog.text

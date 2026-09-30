@@ -16,7 +16,7 @@ plugins:
     - tact-consult
     - tact-recorder
   # Lets tact-recorder send the meeting brief to the model named in tact_recorder.brief_model
-  # (below). It changes nothing while brief_model is unset: the brief then uses the chat model.
+  # (below); no other plugin and no chat turn is affected.
   entries:
     tact-recorder:
       llm:
@@ -58,10 +58,12 @@ stt:
   provider: groq
   language: ""
 
-# Meeting briefs (tact-recorder) use the chat model. To write them with a different OpenRouter
-# model instead (e.g. when the chat model returns broken JSON), uncomment and set:
-# tact_recorder:
-#   brief_model: anthropic/claude-sonnet-4.5
+# Meeting briefs (tact-recorder) only: written by Gemini Flash on OpenRouter, which follows the
+# brief's JSON shape reliably where the chat model did not (broken JSON, lost deadlines, tasks filed
+# as decisions). Chat, reminders and /consult stay on the main model. If this model fails, the brief
+# falls back to the main model for that meeting.
+tact_recorder:
+  brief_model: google/gemini-3.8-flash
 
 # Approvals: always ask the manager in chat; scheduled (cron) jobs have nobody to ask, so any
 # action that needs approval is refused there instead of being auto-approved.

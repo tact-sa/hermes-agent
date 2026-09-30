@@ -266,6 +266,79 @@ def extract_json(text: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+# A decision that hands work to someone ("تكليف خالد بإعداد التقرير", "Omar will send the deck") is a
+# task. An explicit assignment verb names the owner even if the model did not list that person;
+# "<name> will / عليه / سيقوم ..." counts only for a person the meeting already knows.
+_ASSIGN_VERB_RE = re.compile(r"^(?:تم\s+)?(?:تكليف|يكلف|يُكلف|يكلّف|كلف|كُلف|كلّف)\s+|^(?P<en>assign(?:ed)?)\s+",
+                             re.IGNORECASE)
+_ON_RE = re.compile(r"^على\s+")
+_CONNECTOR_RE = re.compile(
+    r"^\s*(?:[:：\-–—،,]\s*|(?:عليه|عليها|سيقوم|ستقوم|سوف\s+يقوم|سوف\s+تقوم|سيتولى|ستتولى|يتولى|تتولى|مسؤول\s+عن"
+    r"|مسؤولة\s+عن|will|should|shall|must|needs\s+to|is\s+to|to|with)\s+)?", re.IGNORECASE)
+_COMPOUND_NAME = frozenset({"عبد", "أبو", "ابو", "ابن", "بن", "آل", "ال"})
+
+
+def _leading_name(text: str, known: Dict[str, str], allow_unknown: bool) -> Tuple[str, str]:
+    """``(canonical name, rest)`` when *text* starts with a person's name, else ``("", text)``."""
+    words = text.split()
+    for n in (3, 2, 1):  # longest known spelling first ("عبد الله", "Abdul Rahman")
+        if len(words) > n and name_key(" ".join(words[:n])) in known:
+            return known[name_key(" ".join(words[:n]))], " ".join(words[n:])
+    if allow_unknown and len(words) > 1:
+        n = 2 if words[0] in _COMPOUND_NAME and len(words) > 2 else 1
+        return " ".join(words[:n]).strip("،,:"), " ".join(words[n:])
+    return "", text
+
+
+def assignment(text: str, known: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """The task a sentence assigns to one person, or None when it is not phrased as an assignment."""
+    text = re.sub(r"\s*([:：])", r" \1", clean(text))  # "خالد: ..." -> "خالد : ..."
+    verb = _ASSIGN_VERB_RE.match(text) or _ON_RE.match(text)
+    name, rest = _leading_name(text[verb.end():] if verb else text, known, allow_unknown=bool(verb))
+    if not name:
+        return None
+    connector = _CONNECTOR_RE.match(rest)
+    if (not verb or verb.groupdict().get("en")) and not connector.group(0).strip():
+        return None  # "<name> <anything>" / "assign X" without "will / عليه / : / to" is not clearly one
+    rest = rest[connector.end():].strip()
+    if rest.startswith("بـ"):
+        rest = rest[2:].strip()
+    elif rest.startswith("ب") and (verb or connector.group(0).strip() in ("سيقوم", "ستقوم", "سوف يقوم", "سوف تقوم")):
+        rest = rest[1:]
+    task, deadline = split_trailing_deadline(rest)
+    if not task:
+        return None
+    return {"person": name, "person_key": name_key(name), "candidates": [], "task": task, "deadline": deadline}
+
+
+def move_assignments(brief: Dict[str, Any], tasks: List[Dict[str, Any]], known: Dict[str, str]) -> None:
+    """Decisions that assign work become tasks (unless already listed), and an unclear task whose
+    text is itself an assignment to one known person gets that owner. In place."""
+    kept, moved = [], 0
+    for item in brief["decisions"]:
+        task = assignment(item, known)
+        if task is None:
+            kept.append(item)
+            continue
+        key = name_key(task["task"])
+        if not any(key in name_key(t["task"]) or name_key(t["task"]) in key for t in tasks):
+            tasks.append(task)
+        moved += 1
+    brief["decisions"] = kept
+    claimed = 0
+    for task in tasks:
+        if task["person"]:
+            continue
+        found = assignment(task["task"], known)
+        if found and name_key(found["person"]) in known:
+            task.update(person=found["person"], person_key=found["person_key"], candidates=[],
+                        task=found["task"], deadline=task["deadline"] or found["deadline"])
+            claimed += 1
+    if moved or claimed:
+        logger.info("tact-recorder: moved %d assignment(s) from decisions to tasks, gave %d unclear task(s) "
+                    "their named owner", moved, claimed)
+
+
 def _task_fields(raw: Any) -> Tuple[str, List[str], str]:
     """``(task, owner names, deadline)`` from one task item: an object with any of the known key
     spellings, or a plain string (then owner and deadline are unknown)."""
@@ -311,6 +384,9 @@ def normalize(parsed: Dict[str, Any], fallback_language: str = "en") -> Tuple[st
         candidates = [] if person else list(dict.fromkeys(canon(c) for c in (cands or owners)))
         tasks.append({"person": person, "person_key": name_key(person), "candidates": candidates,
                       "task": task, "deadline": deadline})
+    known = dict(canonical)
+    known.update({name_key(n): n for t in tasks for n in [t["person"], *t["candidates"]] if n})
+    move_assignments(brief, tasks, known)
     return language, brief, tasks
 
 
@@ -331,25 +407,43 @@ def _shape(parsed: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+class _Route:
+    """Which model this brief's calls go to: ``tact_recorder.brief_model`` until a call to it fails,
+    then the main chat model for the rest of the brief."""
+
+    def __init__(self, model: Optional[str]):
+        self.model = model
+
+    async def call(self, llm: Any, **kw: Any) -> Any:
+        if self.model:
+            try:
+                return await llm.acomplete_structured(**kw, model=self.model)
+            except Exception as exc:  # unavailable, auth, trust gate, ...: the brief must still be written
+                logger.warning("tact-recorder: brief model %s failed (%s); falling back to the main chat model",
+                               self.model, type(exc).__name__)
+                self.model = None
+        return await llm.acomplete_structured(**kw)
+
+
 async def analyze(llm: Any, transcript: str, note: str = "",
                   model: Optional[str] = None) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
     """One structured call, retried once with a stricter instruction when the response holds no
     usable JSON. ``model`` overrides the main model (``tact_recorder.brief_model``)."""
     text = f"Manager's note sent with the recording: {note}\n\n" if note else ""
     blocks = [{"type": "text", "text": f"{text}TRANSCRIPT:\n{transcript}"}]
-    overrides = {"model": model} if model else {}
+    route = _Route(model)
     for attempt in (1, 2):
         instructions = INSTRUCTIONS if attempt == 1 else f"{INSTRUCTIONS}\n\n{STRICT_RETRY}"
-        result = await llm.acomplete_structured(
-            instructions=instructions, input=blocks, json_schema=SCHEMA, schema_name="meeting_brief",
-            purpose="meeting brief", timeout=300, max_tokens=MAX_TOKENS, **overrides)
+        result = await route.call(
+            llm, instructions=instructions, input=blocks, json_schema=SCHEMA, schema_name="meeting_brief",
+            purpose="meeting brief", timeout=300, max_tokens=MAX_TOKENS)
         parsed = result.parsed
         if not _has_brief_keys(parsed):
             parsed = extract_json(result.text)
         if parsed is not None:
             logger.info("tact-recorder: brief shape: %s", _shape(parsed))
             language, brief, tasks = normalize(parsed, guess_language(transcript))
-            followed = await _fill_gaps(llm, transcript, language, brief, tasks, overrides)
+            followed = await _fill_gaps(llm, transcript, language, brief, tasks, route)
             logger.info("tact-recorder: brief counts: decisions=%d open_issues=%d tasks=%d with_deadline=%d"
                         " follow-ups=%s", len(brief["decisions"]), len(brief["open_issues"]), len(tasks),
                         sum(bool(t["deadline"]) for t in tasks), ",".join(followed) or "none")
@@ -361,13 +455,12 @@ async def analyze(llm: Any, transcript: str, note: str = "",
 
 
 async def _followup(llm: Any, instructions: str, text: str, schema: Dict[str, Any], name: str,
-                    overrides: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                    route: _Route) -> Optional[Dict[str, Any]]:
     """One short structured call; None (logged by type only) when it fails or returns no JSON."""
     try:
-        result = await llm.acomplete_structured(
-            instructions=instructions, input=[{"type": "text", "text": text}], json_schema=schema,
-            schema_name=name, purpose=name.replace("_", " "), timeout=120, max_tokens=FOLLOWUP_MAX_TOKENS,
-            **overrides)
+        result = await route.call(
+            llm, instructions=instructions, input=[{"type": "text", "text": text}], json_schema=schema,
+            schema_name=name, purpose=name.replace("_", " "), timeout=120, max_tokens=FOLLOWUP_MAX_TOKENS)
     except Exception as exc:
         logger.warning("tact-recorder: %s follow-up failed: %s", name, type(exc).__name__)
         return None
@@ -425,22 +518,24 @@ def _deadline_pairs(parsed: Dict[str, Any]) -> List[Tuple[int, str]]:
 
 
 async def _fill_gaps(llm: Any, transcript: str, language: str, brief: Dict[str, Any],
-                     tasks: List[Dict[str, Any]], overrides: Dict[str, Any]) -> List[str]:
+                     tasks: List[Dict[str, Any]], route: _Route) -> List[str]:
     """Follow-up calls for what the main call lost; returns which ones ran."""
     ran = []
     if not brief["decisions"] and not brief["open_issues"] and len(transcript) > FOLLOWUP_MIN_TRANSCRIPT:
         ran.append("decisions")
         parsed = await _followup(llm, DECISIONS_INSTRUCTIONS.format(language="Arabic" if language == "ar" else "English"),
-                                 f"TRANSCRIPT:\n{transcript}", DECISIONS_SCHEMA, "meeting_decisions", overrides)
+                                 f"TRANSCRIPT:\n{transcript}", DECISIONS_SCHEMA, "meeting_decisions", route)
         if parsed:
             brief["decisions"] = clean_list(_pick(parsed, _SECTION_KEYS["decisions"]))
             brief["open_issues"] = clean_list(_pick(parsed, _SECTION_KEYS["open_issues"]))
+            known = {name_key(n): n for t in tasks for n in [t["person"], *t["candidates"]] if n}
+            move_assignments(brief, tasks, known)
     if tasks and not any(t["deadline"] for t in tasks) and _DEADLINE_WORDS_RE.search(transcript):
         ran.append("deadlines")
         listing = "\n".join(f"{i}. {t['person'] or ' / '.join(t['candidates']) or '?'} — {t['task']}"
                              for i, t in enumerate(tasks, 1))
         parsed = await _followup(llm, DEADLINES_INSTRUCTIONS, f"TRANSCRIPT:\n{transcript}\n\nTASKS:\n{listing}",
-                                 DEADLINES_SCHEMA, "meeting_deadlines", overrides)
+                                 DEADLINES_SCHEMA, "meeting_deadlines", route)
         for number, deadline in _deadline_pairs(parsed or {}):
             if 1 <= number <= len(tasks) and deadline and not tasks[number - 1]["deadline"]:
                 tasks[number - 1]["deadline"] = deadline
