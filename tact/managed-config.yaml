@@ -7,11 +7,14 @@
 # refuses typing into password/OTP/card/ID fields, and blocks in-page scripts.
 # tact-meetings logs meetings and sends an advance reminder 10 minutes before and a reminder at start.
 # tact-consult answers "/consult <question>" as an executive strategy consultant (only when typed).
+# tact-recorder turns a meeting recording the manager sends into a transcript, a brief and a task
+# list that goes back to the manager only, for confirmation (/recordings, /brief <id>).
 plugins:
   enabled:
     - tact-guard
     - tact-meetings
     - tact-consult
+    - tact-recorder
 
 # The manager works in Riyadh: reminders, meeting times and "now" are all Riyadh time.
 timezone: Asia/Riyadh
