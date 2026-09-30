@@ -42,7 +42,10 @@ def connect() -> sqlite3.Connection:
         " platform TEXT NOT NULL, chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
         " created_at TEXT NOT NULL,"
         " status TEXT NOT NULL DEFAULT 'transcribing',"
-        " language TEXT, transcript_path TEXT, brief TEXT, error TEXT)")
+        " language TEXT, transcript_path TEXT, brief TEXT, error TEXT, note TEXT)")
+    # Databases created before the caption note was kept (it feeds "/brief <id> retry").
+    if "note" not in {row[1] for row in con.execute("PRAGMA table_info(meetings)")}:
+        con.execute("ALTER TABLE meetings ADD COLUMN note TEXT")
     con.execute(
         "CREATE TABLE IF NOT EXISTS tasks ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -61,11 +64,11 @@ def now() -> datetime:
     return datetime.now(TZ)
 
 
-def create_meeting(platform: str, chat_id: str, user_id: str) -> int:
+def create_meeting(platform: str, chat_id: str, user_id: str, note: str = "") -> int:
     with connect() as con:
         return con.execute(
-            "INSERT INTO meetings (platform, chat_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-            (platform, chat_id, user_id, now().isoformat(timespec="seconds"))).lastrowid
+            "INSERT INTO meetings (platform, chat_id, user_id, created_at, note) VALUES (?, ?, ?, ?, ?)",
+            (platform, chat_id, user_id, now().isoformat(timespec="seconds"), note)).lastrowid
 
 
 def update_meeting(meeting_id: int, **fields: Any) -> None:

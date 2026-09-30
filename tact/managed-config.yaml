@@ -15,6 +15,12 @@ plugins:
     - tact-meetings
     - tact-consult
     - tact-recorder
+  # Lets tact-recorder send the meeting brief to the model named in tact_recorder.brief_model
+  # (below). It changes nothing while brief_model is unset: the brief then uses the chat model.
+  entries:
+    tact-recorder:
+      llm:
+        allow_model_override: true
 
 # The manager works in Riyadh: reminders, meeting times and "now" are all Riyadh time.
 timezone: Asia/Riyadh
@@ -51,6 +57,11 @@ stt:
   enabled: true
   provider: groq
   language: ""
+
+# Meeting briefs (tact-recorder) use the chat model. To write them with a different OpenRouter
+# model instead (e.g. when the chat model returns broken JSON), uncomment and set:
+# tact_recorder:
+#   brief_model: anthropic/claude-sonnet-4.5
 
 # Approvals: always ask the manager in chat; scheduled (cron) jobs have nobody to ask, so any
 # action that needs approval is refused there instead of being auto-approved.

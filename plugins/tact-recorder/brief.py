@@ -9,9 +9,25 @@ for them (أحمد / Ahmad), and owners are mapped through that alias table here
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# A long Arabic meeting's brief and task list runs to thousands of tokens; the provider default
+# can cut it off mid-JSON.
+MAX_TOKENS = 8000
+STRICT_RETRY = "Return ONLY one valid JSON object, no prose, no code fences."
+_EXPECTED_KEYS = frozenset({"language", "summary", "decisions", "open_issues", "people", "tasks"})
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n?|\n?```\s*$")
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+class BriefError(Exception):
+    """The model gave no usable brief (after the retry)."""
 
 LABELS = {
     "en": {"summary": "📝 SUMMARY", "decisions": "✅ DECISIONS", "open": "❓ OPEN ISSUES",
@@ -99,9 +115,33 @@ def lang_of(language: Any) -> str:
     return "ar" if str(language or "").lower().startswith("ar") else "en"
 
 
-def normalize(parsed: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
-    """``(language, brief, tasks)`` from the model's JSON, owners mapped to one spelling each."""
-    language = lang_of(parsed.get("language"))
+def guess_language(text: str) -> str:
+    """Main script of *text*: "ar" when Arabic letters outnumber Latin ones."""
+    return "ar" if len(_ARABIC_RE.findall(text or "")) > len(_LATIN_RE.findall(text or "")) else "en"
+
+
+def extract_json(text: Any) -> Optional[Dict[str, Any]]:
+    """The brief object from a model response that may wrap it in code fences or prose, or None.
+    Accepted when it carries at least one of the expected keys, even if the strict schema failed."""
+    raw = str(text or "").strip()
+    candidates = [raw, _FENCE_RE.sub("", raw).strip()]
+    start, end = raw.find("{"), raw.rfind("}")
+    if 0 <= start < end:
+        candidates.append(raw[start:end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and _EXPECTED_KEYS & parsed.keys():
+            return parsed
+    return None
+
+
+def normalize(parsed: Dict[str, Any], fallback_language: str = "en") -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    """``(language, brief, tasks)`` from the model's JSON, owners mapped to one spelling each.
+    Missing or malformed fields become empty (shown as None / NOT MENTIONED / UNCLEAR)."""
+    language = lang_of(parsed.get("language") or fallback_language)
     brief = {"summary": clean_list(parsed.get("summary"))[:8],
              "decisions": clean_list(parsed.get("decisions")),
              "open_issues": clean_list(parsed.get("open_issues"))}
@@ -127,15 +167,27 @@ def normalize(parsed: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Dict[st
     return language, brief, tasks
 
 
-async def analyze(llm: Any, transcript: str, note: str = "") -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+async def analyze(llm: Any, transcript: str, note: str = "",
+                  model: Optional[str] = None) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    """One structured call, retried once with a stricter instruction when the response holds no
+    usable JSON. ``model`` overrides the main model (``tact_recorder.brief_model``)."""
     text = f"Manager's note sent with the recording: {note}\n\n" if note else ""
-    result = await llm.acomplete_structured(
-        instructions=INSTRUCTIONS, input=[{"type": "text", "text": f"{text}TRANSCRIPT:\n{transcript}"}],
-        json_schema=SCHEMA, schema_name="meeting_brief", purpose="meeting brief", timeout=300)
-    parsed = result.parsed
-    if not isinstance(parsed, dict):
-        parsed = json.loads(result.text)
-    return normalize(parsed)
+    blocks = [{"type": "text", "text": f"{text}TRANSCRIPT:\n{transcript}"}]
+    overrides = {"model": model} if model else {}
+    for attempt in (1, 2):
+        instructions = INSTRUCTIONS if attempt == 1 else f"{INSTRUCTIONS}\n\n{STRICT_RETRY}"
+        result = await llm.acomplete_structured(
+            instructions=instructions, input=blocks, json_schema=SCHEMA, schema_name="meeting_brief",
+            purpose="meeting brief", timeout=300, max_tokens=MAX_TOKENS, **overrides)
+        parsed = result.parsed
+        if not (isinstance(parsed, dict) and _EXPECTED_KEYS & parsed.keys()):
+            parsed = extract_json(result.text)
+        if parsed is not None:
+            return normalize(parsed, guess_language(transcript))
+        # Length and stop reason only: the response itself is meeting content and never logged.
+        logger.warning("tact-recorder: brief response is not valid JSON (attempt %d/2, %d chars, finish_reason=%s)",
+                       attempt, len(result.text or ""), getattr(result, "finish_reason", "") or "unknown")
+    raise BriefError("the model returned no valid JSON")
 
 
 # -- formatting --------------------------------------------------------------------------------

@@ -67,6 +67,8 @@ class PluginLlmCompleteResult:
     agent_id: str
     usage: PluginLlmUsage = field(default_factory=PluginLlmUsage)
     audit: Dict[str, Any] = field(default_factory=dict)
+    # Provider stop reason ("stop", "length", ...); "" when the response carries none.
+    finish_reason: str = ""
 
 
 @dataclass
@@ -84,6 +86,7 @@ class PluginLlmStructuredResult:
     parsed: Optional[Any] = None
     content_type: str = "text"
     audit: Dict[str, Any] = field(default_factory=dict)
+    finish_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -361,6 +364,15 @@ def _extract_usage(response: Any) -> PluginLlmUsage:
     )
 
 
+def _extract_finish_reason(response: Any) -> str:
+    """Stop reason of an OpenAI-shaped response ("length" = cut off at max_tokens), or ""."""
+    try:
+        reason = getattr(response.choices[0], "finish_reason", None)
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return reason if isinstance(reason, str) else ""
+
+
 def _extract_text(response: Any) -> str:
     """Assistant text of an OpenAI-shaped response (string or text-part list content)."""
     try:
@@ -528,7 +540,8 @@ class PluginLlm:
         usage = _extract_usage(response)
         eff_task = kw["task"] or ""
         audit: Dict[str, Any] = {"plugin_id": self._plugin_id, "purpose": purpose or "", "profile": kw["profile_override"] or ""}
-        fields: Dict[str, Any] = dict(text=text, provider=real_provider, model=real_model, agent_id=agent_id or "default", usage=usage)
+        fields: Dict[str, Any] = dict(text=text, provider=real_provider, model=real_model, agent_id=agent_id or "default",
+                                      usage=usage, finish_reason=_extract_finish_reason(response))
         fmt = f"plugin_llm.{name} plugin=%s provider=%s model=%s task=%s purpose=%s "
         log_args = [self._plugin_id, real_provider, real_model, eff_task, purpose or ""]
         cls: Any = PluginLlmCompleteResult

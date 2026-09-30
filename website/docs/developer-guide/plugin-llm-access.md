@@ -225,7 +225,7 @@ result = ctx.llm.complete(
     purpose="optional-audit-string",
     task=None,             # optional — a plugin-registered auxiliary slot
 )
-# → PluginLlmCompleteResult(text, provider, model, agent_id, usage, audit)
+# → PluginLlmCompleteResult(text, provider, model, agent_id, usage, audit, finish_reason)
 ```
 
 Plain chat completion. `messages` is the standard OpenAI shape — a
@@ -264,7 +264,7 @@ result = ctx.llm.complete_structured(
     task=None,             # optional — a plugin-registered auxiliary slot
 )
 # → PluginLlmStructuredResult(text, provider, model, agent_id,
-#                             usage, parsed, content_type, audit)
+#                             usage, parsed, content_type, audit, finish_reason)
 ```
 
 Inputs are typed text or image blocks (raw bytes get base64 encoded
@@ -335,6 +335,7 @@ class PluginLlmCompleteResult:
     agent_id: str                # whose model/auth was used
     usage: PluginLlmUsage        # tokens + cache + cost estimate
     audit: Dict[str, Any]        # plugin_id, purpose, profile
+    finish_reason: str           # provider stop reason ("stop", "length", ...) or ""
 
 @dataclass
 class PluginLlmStructuredResult:

@@ -328,3 +328,81 @@ def test_minutes_is_cancelled_by_a_text_message_or_after_ten_minutes(recorder, t
     late = _short_voice(tmp_path, "b.ogg")
     assert _dispatch(mod, gw, late) is late
     assert not stt_calls and not gw.adapter.sent
+
+
+AR_TRANSCRIPT = "اتفقنا أن يرسل أحمد الميزانية"
+
+
+def test_brief_json_is_recovered_from_code_fences_and_prose(recorder, monkeypatch):
+    fmt = recorder.brief
+    body = json.dumps(ANALYSIS, ensure_ascii=False)
+    for text in (f"```json\n{body}\n```", f"Here is the brief you asked for:\n{body}\nLet me know if you need more."):
+        llm = FakeLlm(None)
+        llm.acomplete_structured = lambda _t=text, **kw: _result(llm, kw, _t)
+        language, brief, tasks = asyncio.run(fmt.analyze(llm, "transcript"))
+        assert language == "en" and brief["decisions"] == ["Launch moves to May"] and len(tasks) == 3
+        assert len(llm.calls) == 1 and llm.calls[0]["max_tokens"] >= 8000
+
+    # Only some keys (strict schema failed): the rest is filled safely, never invented.
+    partial = '{"summary": ["اجتماع قصير"], "tasks": [{"task": "إرسال الميزانية"}]}'
+    llm = FakeLlm(None)
+    llm.acomplete_structured = lambda **kw: _result(llm, kw, partial)
+    language, brief, tasks = asyncio.run(fmt.analyze(llm, AR_TRANSCRIPT))
+    rows = [dict(t, position=1, status="pending") for t in tasks]
+    text = fmt.brief_text(1, "2026-09-30T10:00:00", language, brief, rows)
+    assert language == "ar" and brief["decisions"] == [] and brief["open_issues"] == []
+    assert "1. ❓ غير واضح → إرسال الميزانية → غير مذكور" in text
+
+
+async def _result(llm, kw, text):
+    llm.calls.append(kw)
+    return SimpleNamespace(parsed=None, text=text, finish_reason="stop")
+
+
+def test_broken_json_is_retried_then_brief_retry_rewrites_it_from_the_transcript(recorder, tmp_path, monkeypatch, caplog):
+    import hermes_yaml as yaml
+    mod = recorder
+    home = Path(mod.store.recordings_dir()).parent
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"enabled": ["tact-recorder"],
+                    "entries": {"tact-recorder": {"llm": {"allow_model_override": True}}}},
+        "tact_recorder": {"brief_model": "anthropic/claude-sonnet-4.5"}}))
+    _fake_stt(monkeypatch, [SECRET_LINE])
+    broken = '{"summary": ["The team reviewed Q3", "tasks": [{"owner": "Ahmad", "task": "Send the'
+    replies = []  # model outputs, consumed in order by the real ctx.llm through an injected caller
+    calls = []
+
+    async def caller(**kw):
+        calls.append(kw)
+        text = replies.pop(0)
+        choice = SimpleNamespace(message=SimpleNamespace(content=text), finish_reason="length" if text == broken else "stop")
+        return "openrouter", kw["model_override"] or "main", SimpleNamespace(choices=[choice], usage=None)
+    monkeypatch.setattr(mod._LLM, "_async_caller", caller)
+    gw = FakeGateway()
+    caplog.set_level(logging.DEBUG)
+    failed = "⚠️ Meeting #1: the brief could not be written. Send /brief 1 retry to try again."
+
+    replies[:] = [broken, broken]
+    event = _event(media=[_wav(tmp_path / "m.wav", 1)], raw=SimpleNamespace(audio=SimpleNamespace(file_size=32000)))
+    assert _dispatch(mod, gw, event) is None
+    assert gw.adapter.sent == [mod.STARTED, failed]
+    sent_text = [json.dumps(c["messages"], ensure_ascii=False) for c in calls]
+    assert len(calls) == 2 and mod.brief.STRICT_RETRY not in sent_text[0] and mod.brief.STRICT_RETRY in sent_text[1]
+    assert all(c["model_override"] == "anthropic/claude-sonnet-4.5" and c["max_tokens"] >= 8000 for c in calls)
+    assert f"{len(broken)} chars, finish_reason=length" in caplog.text
+    assert SECRET_LINE not in caplog.text and "Send the" not in caplog.text  # no transcript or model output
+    assert mod._cmd_brief("1") == failed
+
+    def retry():
+        gw.adapter.sent.clear()
+        assert _dispatch(mod, gw, _event(text="/brief 1 retry", message_type="TEXT")) is None
+        return gw.adapter.sent
+
+    replies[:] = [broken, broken]  # the retry fails too: the same message, so the manager can try again
+    assert retry() == ["📝 Writing the brief for meeting #1 again…", failed]
+    replies[:] = [broken, "```json\n" + json.dumps(ANALYSIS) + "\n```"]
+    started, brief, prompt = retry()
+    assert "1. Ahmad → Send the Q3 budget → Sunday" in brief and "confirm all" in prompt
+    assert SECRET_LINE in json.dumps(calls[-1]["messages"])  # rebuilt from the saved transcript
+    assert mod.store.get_meeting(1, "telegram", CHAT)["status"] == "pending"
+    assert retry() == ["Meeting #1 already has a brief. Show it with /brief 1."]
