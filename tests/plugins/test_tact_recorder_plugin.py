@@ -50,9 +50,44 @@ class FakeAdapter:
         return SimpleNamespace(success=True)
 
 
+class FakeBot:
+    """Telegram bot stand-in: every message it sends or edits, by message id."""
+
+    def __init__(self):
+        self.messages, self.edits, self._next = {}, [], 100
+
+    async def send_message(self, chat_id, text, reply_markup=None):
+        self._next += 1
+        self.messages[self._next] = (text, reply_markup)
+        return SimpleNamespace(message_id=self._next)
+
+    async def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+        assert message_id in self.messages, "only our own messages are edited"
+        self.edits.append(message_id)
+        self.messages[message_id] = (text, reply_markup)
+
+
+def _buttons(markup):
+    return [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard] if markup else []
+
+
+@pytest.fixture
+def telegram_stub(monkeypatch):
+    """The few python-telegram-bot classes the plugin builds (the test env has no telegram extra)."""
+    import sys
+    tg = SimpleNamespace(
+        InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data),
+        InlineKeyboardMarkup=lambda rows: SimpleNamespace(inline_keyboard=rows))
+    ext = SimpleNamespace(CallbackQueryHandler=lambda callback, pattern: SimpleNamespace(callback=callback, pattern=pattern))
+    monkeypatch.setitem(sys.modules, "telegram", tg)
+    monkeypatch.setitem(sys.modules, "telegram.ext", ext)
+
+
 class FakeGateway:
-    def __init__(self, authorized=True):
+    def __init__(self, authorized=True, bot=False):
         self.adapter = FakeAdapter()
+        if bot:
+            self.adapter._bot = FakeBot()
         self.authorized = authorized
 
     def _is_user_authorized_for_source(self, _source):
@@ -127,7 +162,8 @@ ANALYSIS = {
 }
 
 
-def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(recorder, tmp_path, monkeypatch, caplog):
+def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(recorder, telegram_stub, tmp_path,
+                                                                            monkeypatch, caplog):
     import hermes_yaml as yaml
     mod = recorder
     managed = yaml.safe_load((REPO_ROOT / "tact" / "managed-config.yaml").read_text())
@@ -136,7 +172,7 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
     stt_calls = _fake_stt(monkeypatch, [SECRET_LINE])
     llm = FakeLlm(ANALYSIS)
     monkeypatch.setattr(mod, "_LLM", llm)
-    gw = FakeGateway()
+    gw = FakeGateway(bot=True)
     caplog.set_level(logging.DEBUG)
 
     # Someone off the allowlist: untouched (the gateway's own auth refuses it next), nothing sent.
@@ -152,7 +188,7 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
     event = _event(text="weekly sync", media=[cached], raw=SimpleNamespace(audio=SimpleNamespace(file_size=64000)))
     assert _dispatch(mod, gw, event) is None
 
-    started, brief, prompt = gw.adapter.sent
+    started, brief = gw.adapter.sent
     assert started == mod.STARTED
     assert len(stt_calls) == 1
     home_rec = Path(mod.store.recordings_dir())
@@ -162,12 +198,17 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
     sent_to_llm = llm.calls[0]["input"][0]["text"]
     assert SECRET_LINE in sent_to_llm and "weekly sync" in sent_to_llm
 
-    for header in ("📝 SUMMARY", "✅ DECISIONS", "❓ OPEN ISSUES", "📋 TASKS"):
+    # The brief carries no task list; the tasks follow as one message each, with their own buttons.
+    for header in ("📝 SUMMARY", "✅ DECISIONS", "❓ OPEN ISSUES"):
         assert header in brief
-    assert "1. Ahmad → Send the Q3 budget → Sunday" in brief
-    assert "3. Ahmad → Book the launch venue → NOT MENTIONED" in brief
-    assert "Ahmad: 1) Send the Q3 budget (Sunday) [#1] 2) Book the launch venue (NOT MENTIONED) [#3]" in brief
-    assert "confirm all" in prompt
+    assert brief.endswith("\n\n📋 Tasks (3) in the following messages") and "Send the Q3 budget" not in brief
+    (card1, m1), (card2, m2), (card3, _), (all_text, all_markup) = gw.adapter._bot.messages.values()
+    assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday"
+    assert _buttons(m1) == [[("✅ Confirm", "rec:c:1:1"), ("✏️ Edit", "rec:e:1:1"), ("❌ Remove", "rec:r:1:1")]]
+    assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED"
+    assert card3.startswith("📋 Task 3 of 3\n👤 Ahmad")
+    assert _buttons(all_markup) == [[("✅ Confirm all (3)", "rec:a:1:0")]] and "confirm 2" in all_text
+    assert not any("[#" in text for text, _ in gw.adapter._bot.messages.values())
     tasks = mod.store.tasks_for(1)
     assert [t["status"] for t in tasks] == ["pending"] * 3
     assert mod.store.get_meeting(1, "telegram", CHAT)["status"] == "pending"
@@ -223,19 +264,22 @@ def test_too_large_recording_gets_the_compress_or_split_reply(recorder, monkeypa
 
 def test_unclear_owner_is_flagged_and_spellings_merge_into_one_person(recorder):
     fmt = recorder.brief
-    for lang, unclear in (("en", "❓ UNCLEAR: Ahmad or Omar?"), ("ar", "❓ غير واضح: أحمد أو عمر؟")):
+    for lang, unclear, missing in (("en", "❓ UNCLEAR: Ahmad or Omar?", "NOT MENTIONED"),
+                                   ("ar", "❓ غير واضح: أحمد أو عمر؟", "غير مذكور")):
         parsed = dict(ANALYSIS, language=lang)
         if lang == "ar":
             parsed["people"] = [{"name": "أحمد", "aliases": ["Ahmad"]}, {"name": "عمر", "aliases": ["Omar"]}]
         language, brief, tasks = fmt.normalize(parsed)
-        rows = [dict(t, position=i, status="pending") for i, t in enumerate(tasks, 1)]
-        text = fmt.brief_text(1, "2026-09-30T10:00:00", language, brief, rows)
-        assert f"2. {unclear} → Call the vendor" in text
         owner = "Ahmad" if lang == "en" else "أحمد"
         assert [t["person"] for t in tasks] == [owner, "", owner]
-        grouped = fmt.by_person(rows, language)
-        assert grouped[0].startswith(f"{owner}: 1) Send the Q3 budget") and "2) Book the launch venue" in grouped[0]
-        assert grouped[-1].startswith(unclear.split(":")[0])  # unclear owners listed last, never guessed
+        rows = [dict(t, position=i, status="confirmed") for i, t in enumerate(tasks, 1)]
+        assert f"👤 {unclear}\n📌 Call the vendor\n📅 {missing}" in fmt.task_card(rows[1], 3, language)
+        # The final summary: grouped by person, the task's own number, no brackets; unclear owners last.
+        title = "✅ Confirmed tasks — Meeting #1" if lang == "en" else "✅ المهام المؤكدة — اجتماع #1"
+        assert fmt.final_text(1, language, rows) == (
+            f"{title}\n\n👤 {owner}\n1. Send the Q3 budget — Sunday\n3. Book the launch venue — {missing}"
+            f"\n\n👤 {unclear.split(':')[0]}\n2. Call the vendor — {missing}")
+    assert fmt.brief_text(1, "2026-09-30T10:00:00", "ar", brief, 3).endswith("📋 المهام (3) في الرسائل التالية")
 
 
 def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkeypatch):
@@ -251,22 +295,18 @@ def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkey
         assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
         return gw.adapter.sent
 
+    # No task cards to edit on this platform: each change is confirmed with a short text reply.
     assert reply("remove 3") == ["❌ Task 3 removed. (2 still to confirm)"]
-    edited = reply("edit 2: Omar, due Sunday")[0]
-    assert "2. Omar → Call the vendor → Sunday" in edited
-    # Buttons: only the manager who sent the recording may act on it.
-    assert mod.handle_button(f"rec:c:{meeting_id}:1", "telegram", CHAT, "99") == ([], "Not allowed.", False)
-    replies, _, done = mod.handle_button(f"rec:c:{meeting_id}:1", "telegram", CHAT, MANAGER)
-    assert replies == ["✅ Task 1 confirmed. (1 still to confirm)"] and not done
+    assert "👤 Omar\n📌 Call the vendor\n📅 Sunday" in reply("edit 2: Omar, due Sunday")[0]
+    assert reply("confirm 1") == ["✅ Task 1 confirmed. (1 still to confirm)"]
     # ✏️ then a plain message edits that task.
-    assert "task 2" in mod.handle_button(f"rec:e:{meeting_id}:2", "telegram", CHAT, MANAGER)[0][0]
-    assert "→ Call the vendor about prices →" in reply("task: Call the vendor about prices")[0]
+    outcome, _ = mod.handle_button(f"rec:e:{meeting_id}:2", "telegram", CHAT, MANAGER)
+    assert "task 2" in outcome.messages[0]
+    assert "📌 Call the vendor about prices" in reply("task: Call the vendor about prices")[0]
 
-    final = reply("confirm all")[-1]
-    assert final.startswith(f"✅ Confirmed tasks — Meeting #{meeting_id}")
-    assert "Ahmad: 1) Send the Q3 budget (Sunday) [#1]" in final
-    assert "Omar: 1) Call the vendor about prices (Sunday) [#2]" in final
-    assert "Book the launch venue" not in final
+    assert reply("تأكيد الكل") == [
+        f"✅ Confirmed tasks — Meeting #{meeting_id}\n\n👤 Ahmad\n1. Send the Q3 budget — Sunday"
+        "\n\n👤 Omar\n2. Call the vendor about prices — Sunday"]
     assert [t["status"] for t in store.tasks_for(meeting_id)] == ["confirmed", "confirmed", "removed"]
     assert store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
     # Nothing pending any more: confirmation words are ordinary messages again.
@@ -276,7 +316,76 @@ def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkey
     listing = mod._cmd_recordings("")
     assert f"#{meeting_id}" in listing and "✅ confirmed" in listing
     shown = mod._cmd_brief(str(meeting_id))
-    assert "✅ 1. Ahmad → Send the Q3 budget → Sunday" in shown and "❌ 3." in shown
+    assert "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed" in shown
+    assert "📋 Task 3 of 3" in shown and "❌ Removed" in shown and "[#" not in shown
+
+
+def _seed(mod, n_tasks=3):
+    language, brief, tasks = mod.brief.normalize(ANALYSIS)
+    if n_tasks > len(tasks):
+        tasks = [dict(tasks[0], task=f"Task number {i}") for i in range(1, n_tasks + 1)]
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, language, brief, tasks)
+    return meeting_id
+
+
+def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, telegram_stub):
+    mod = recorder
+    meeting_id = _seed(mod)
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    # /brief <id> shows the same layout: the brief, a card per task, then "Confirm all".
+    assert _dispatch(mod, gw, _event(text=f"/brief {meeting_id}", message_type="TEXT")) is None
+    assert gw.adapter.sent[0].endswith("📋 Tasks (3) in the following messages")
+    card1, card2, card3, all_id = bot.messages
+    handlers = []
+    mod._telegram_handlers(SimpleNamespace(add_handler=handlers.append), gw.adapter)
+
+    def press(data, message_id, user=MANAGER):
+        toasts = []
+
+        async def answer(text=None):
+            toasts.append(text)
+        query = SimpleNamespace(data=data, from_user=SimpleNamespace(id=int(user)), answer=answer,
+                                message=SimpleNamespace(chat=SimpleNamespace(id=int(CHAT)), message_id=message_id))
+        asyncio.run(handlers[0].callback(SimpleNamespace(callback_query=query), None))
+        return toasts
+
+    def reply(text):
+        assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
+
+    gw.adapter.sent.clear()
+    reply("حذف 3")  # a text reply edits that task's card, like its button would
+    text, markup = bot.messages[card3]
+    assert text.endswith("\n\n❌ Removed") and markup is None
+    assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (2)", f"rec:a:{meeting_id}:0")]]
+
+    assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."] and bot.edits == [card3, all_id]
+    press(f"rec:c:{meeting_id}:1", card1)
+    text, markup = bot.messages[card1]
+    assert text == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed" and markup is None
+
+    reply("edit 2: Omar, due Sunday")  # still pending: new text, buttons stay
+    text, markup = bot.messages[card2]
+    assert text == "📋 Task 2 of 3\n👤 Omar\n📌 Call the vendor\n📅 Sunday" and len(_buttons(markup)[0]) == 3
+    assert gw.adapter.sent == []  # every change so far edited a message instead of sending one
+
+    press(f"rec:a:{meeting_id}:0", all_id)
+    assert bot.messages[card2][0].endswith("✅ Confirmed") and bot.messages[card2][1] is None
+    assert bot.messages[all_id] == ("✅ All tasks handled.", None)
+    assert gw.adapter.sent == [f"✅ Confirmed tasks — Meeting #{meeting_id}\n\n👤 Ahmad\n1. Send the Q3 budget — Sunday"
+                               "\n\n👤 Omar\n2. Call the vendor — Sunday"]
+
+
+def test_more_than_fifteen_tasks_go_in_one_list_with_text_replies(recorder, telegram_stub):
+    mod = recorder
+    meeting_id = _seed(mod, n_tasks=16)
+    gw = FakeGateway(bot=True)
+    assert _dispatch(mod, gw, _event(text=f"/brief {meeting_id}", message_type="TEXT")) is None
+    brief, tasks = gw.adapter.sent
+    assert brief.endswith("📋 Tasks (16) in the next message") and not gw.adapter._bot.messages
+    assert tasks.startswith("📋 Tasks (16)") and "📋 Task 16 of 16\n👤 Ahmad\n📌 Task number 16" in tasks
+    assert '"confirm 2"' in tasks
 
 
 def _short_voice(tmp_path, name, text=""):
@@ -348,10 +457,9 @@ def test_brief_json_is_recovered_from_code_fences_and_prose(recorder, monkeypatc
     llm = FakeLlm(None)
     llm.acomplete_structured = lambda **kw: _result(llm, kw, partial)
     language, brief, tasks = asyncio.run(fmt.analyze(llm, AR_TRANSCRIPT))
-    rows = [dict(t, position=1, status="pending") for t in tasks]
-    text = fmt.brief_text(1, "2026-09-30T10:00:00", language, brief, rows)
+    card = fmt.task_card(dict(tasks[0], position=1, status="pending"), 1, language)
     assert language == "ar" and brief["decisions"] == [] and brief["open_issues"] == []
-    assert "1. ❓ غير واضح → إرسال الميزانية → غير مذكور" in text
+    assert card == "📋 مهمة 1 من 1\n👤 ❓ غير واضح\n📌 إرسال الميزانية\n📅 غير مذكور"
 
 
 async def _result(llm, kw, text):
@@ -401,8 +509,9 @@ def test_broken_json_is_retried_then_brief_retry_rewrites_it_from_the_transcript
     replies[:] = [broken, broken]  # the retry fails too: the same message, so the manager can try again
     assert retry() == ["📝 Writing the brief for meeting #1 again…", failed]
     replies[:] = [broken, "```json\n" + json.dumps(ANALYSIS) + "\n```"]
-    started, brief, prompt = retry()
-    assert "1. Ahmad → Send the Q3 budget → Sunday" in brief and "confirm all" in prompt
+    started, brief, tasks = retry()  # no inline buttons here: the tasks come as one list
+    assert brief.endswith("📋 Tasks (3) in the next message")
+    assert "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday" in tasks and "confirm all" in tasks
     assert SECRET_LINE in json.dumps(calls[-1]["messages"])  # rebuilt from the saved transcript
     assert mod.store.get_meeting(1, "telegram", CHAT)["status"] == "pending"
     assert retry() == ["Meeting #1 already has a brief. Show it with /brief 1."]

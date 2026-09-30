@@ -42,10 +42,8 @@ def connect() -> sqlite3.Connection:
         " platform TEXT NOT NULL, chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
         " created_at TEXT NOT NULL,"
         " status TEXT NOT NULL DEFAULT 'transcribing',"
-        " language TEXT, transcript_path TEXT, brief TEXT, error TEXT, note TEXT)")
-    # Databases created before the caption note was kept (it feeds "/brief <id> retry").
-    if "note" not in {row[1] for row in con.execute("PRAGMA table_info(meetings)")}:
-        con.execute("ALTER TABLE meetings ADD COLUMN note TEXT")
+        " language TEXT, transcript_path TEXT, brief TEXT, error TEXT, note TEXT,"
+        " confirm_message_id TEXT)")
     con.execute(
         "CREATE TABLE IF NOT EXISTS tasks ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -55,8 +53,14 @@ def connect() -> sqlite3.Connection:
         " candidates TEXT NOT NULL DEFAULT '[]',"
         " task TEXT NOT NULL, deadline TEXT NOT NULL DEFAULT '',"
         " status TEXT NOT NULL DEFAULT 'pending',"
-        " confirmed_at TEXT, sent_at TEXT,"
+        " confirmed_at TEXT, sent_at TEXT, message_id TEXT,"
         " UNIQUE (meeting_id, position))")
+    # Columns added after the first release, added in place to existing databases: the caption note
+    # (feeds "/brief <id> retry") and the Telegram message ids of each task card and of the
+    # "Confirm all" message (edited in place when a task changes).
+    for table, column in (("meetings", "note"), ("meetings", "confirm_message_id"), ("tasks", "message_id")):
+        if column not in {row[1] for row in con.execute(f"PRAGMA table_info({table})")}:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
     return con
 
 
@@ -125,6 +129,12 @@ def set_task_status(meeting_id: int, positions: List[int], status: str) -> None:
     with connect() as con:
         con.executemany("UPDATE tasks SET status = ?, confirmed_at = ? WHERE meeting_id = ? AND position = ?",
                         [(status, stamp, meeting_id, p) for p in positions])
+
+
+def set_task_message(meeting_id: int, position: int, message_id: Any) -> None:
+    with connect() as con:
+        con.execute("UPDATE tasks SET message_id = ? WHERE meeting_id = ? AND position = ?",
+                    (str(message_id), meeting_id, position))
 
 
 def update_task(meeting_id: int, position: int, **fields: Any) -> None:

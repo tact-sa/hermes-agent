@@ -18,8 +18,9 @@ sends an ordinary text message instead.
 The event is then dropped from normal dispatch and processed in the background: the audio moves to
 ``<home>/recordings/<id>/``, is split and transcribed (``audio.py``), the transcript is saved and
 the audio deleted, one structured LLM call writes the brief and extracts the tasks (``brief.py``),
-and the tasks go back to the manager for confirmation (``confirm.py``): inline buttons on Telegram
-(``rec:`` callbacks, scoped so the core button flows keep working) or text replies elsewhere.
+and the tasks go back to the manager for confirmation (``confirm.py``, shown by ``present.py``):
+on Telegram one message per task with its own buttons (``rec:`` callbacks, scoped so the core
+button flows keep working), edited in place as tasks are handled; otherwise one list and text replies.
 Nothing is ever sent to anyone but the manager who sent the recording.
 
 The brief is retried once inside ``brief.analyze`` when the model returns no usable JSON; if it
@@ -48,13 +49,13 @@ from typing import Any, Dict, Optional, Tuple
 from . import audio
 from . import brief as fmt
 from . import confirm
+from . import present
 from . import store
 
 logger = logging.getLogger(__name__)
 
 VOICE_MIN_SECONDS = 180
 TELEGRAM_MAX_BYTES = 20 * 1024 * 1024
-MAX_BUTTON_TASKS = 30  # 3 buttons per task + "Confirm all" stays under Telegram's 100-button cap
 EDIT_TTL_SECONDS = 15 * 60
 MINUTES_TTL_SECONDS = 10 * 60
 
@@ -73,6 +74,7 @@ _minutes_armed: Dict[Tuple[str, str], float] = {}
 _BUTTON_RE = re.compile(r"^rec:([acer]):(\d+):(\d+)$")
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove"}
 _RETRY_RE = re.compile(r"^#?(\d+)\s+retry$", re.IGNORECASE)
+_SHOW_RE = re.compile(r"^#?(\d+)$")
 
 
 # -- recognising a recording ---------------------------------------------------------------------
@@ -140,36 +142,11 @@ def _adapter(gateway: Any, source: Any) -> Any:
     return adapter or (getattr(gateway, "adapters", None) or {}).get(source.platform)
 
 
-async def _send(adapter: Any, chat_id: str, text: str) -> None:
-    if adapter is None:
-        logger.warning("tact-recorder: no adapter to reply on")
-        return
-    result = await adapter.send(chat_id, text)
-    if result is not None and not getattr(result, "success", True):
-        logger.warning("tact-recorder: reply failed: %s", getattr(result, "error", "unknown"))
+_send = present.send
 
 
 def _platform(source: Any) -> str:
     return getattr(source.platform, "value", str(source.platform))
-
-
-async def _send_confirmation(adapter: Any, source: Any, meeting_id: int, lang: str, tasks: list) -> None:
-    labels = fmt.LABELS[lang]
-    text = f"{labels['legend']}\n{labels['text_help']}"
-    bot = getattr(adapter, "_bot", None)
-    if _platform(source) == "telegram" and bot is not None:
-        try:
-            from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
-            rows = [[Button(f"{mark} {t['position']}", callback_data=f"rec:{code}:{meeting_id}:{t['position']}")
-                     for mark, code in (("✅", "c"), ("✏️", "e"), ("❌", "r"))]
-                    for t in tasks[:MAX_BUTTON_TASKS]]
-            rows.append([Button(labels["confirm_all"], callback_data=f"rec:a:{meeting_id}:0")])
-            chat_id = int(source.chat_id) if str(source.chat_id).lstrip("-").isdigit() else source.chat_id
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(rows))
-            return
-        except Exception as exc:
-            logger.warning("tact-recorder: confirmation buttons failed, sending text: %s", type(exc).__name__)
-    await _send(adapter, source.chat_id, text)
 
 
 # -- the pipeline --------------------------------------------------------------------------------
@@ -220,12 +197,8 @@ async def write_brief(adapter: Any, source: Any, meeting_id: int, transcript: st
         await _send(adapter, source.chat_id, BRIEF_FAILED.format(id=meeting_id))
         return
     store.save_analysis(meeting_id, lang, brief, tasks)
-    meeting = store.get_meeting(meeting_id, _platform(source), str(source.chat_id))
-    rows = store.tasks_for(meeting_id)
-    logger.info("tact-recorder: meeting #%s briefed, %d task(s)", meeting_id, len(rows))
-    await _send(adapter, source.chat_id, fmt.brief_text(meeting_id, meeting["created_at"], lang, brief, rows))
-    if rows:
-        await _send_confirmation(adapter, source, meeting_id, lang, rows)
+    logger.info("tact-recorder: meeting #%s briefed, %d task(s)", meeting_id, len(tasks))
+    await present.show_meeting(adapter, _platform(source), str(source.chat_id), meeting_id)
 
 
 def _start_job(coro: Any) -> None:
@@ -266,8 +239,8 @@ async def _retry_brief(gateway: Any, source: Any, meeting_id: int) -> str:
     return f"📝 Writing the brief for meeting #{meeting_id} again…"
 
 
-def _text_replies(platform: str, chat_id: str, text: str) -> Optional[list]:
-    """Replies when *text* answers a pending confirmation in this chat, else None (not ours)."""
+def _text_replies(platform: str, chat_id: str, text: str) -> Optional[confirm.Outcome]:
+    """The outcome when *text* answers a pending confirmation in this chat, else None (not ours)."""
     command = confirm.parse_command(text)
     awaiting = _awaiting_edit.pop((platform, chat_id), None)
     if command is None and awaiting and awaiting[2] > time.monotonic():
@@ -293,9 +266,10 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
     has_attachment = bool(event.media_urls) or _attachment(getattr(event, "raw_message", None))[1] is not None
     force = has_attachment and (command == "minutes" or _minutes_armed.get(key, 0.0) > time.monotonic())
     kind, path = classify(event, int(getattr(adapter, "_max_doc_bytes", 0) or TELEGRAM_MAX_BYTES), force)
-    retry = _RETRY_RE.match(event.get_command_args().strip()) if command == "brief" and not has_attachment else None
+    brief_args = event.get_command_args().strip() if command == "brief" and not has_attachment else ""
+    retry, show = _RETRY_RE.match(brief_args), _SHOW_RE.match(brief_args)
     # Other commands (a bare /minutes included) go on to the gateway's command dispatch.
-    if not kind and not retry and (has_attachment or not text.strip() or command):
+    if not kind and not retry and not show and (has_attachment or not text.strip() or command):
         return None
     # Only the manager: anyone else continues to the gateway's normal refusal / pairing path.
     if not gateway._is_user_authorized_for_source(source):
@@ -310,6 +284,15 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
             # background through the adapter, which only this hook can reach.
             await _send(adapter, source.chat_id, await _retry_brief(gateway, source, int(retry.group(1))))
             return {"action": "skip", "reason": "tact-recorder: brief retry"}
+        if show:
+            # Here too: the brief and its task cards are several messages with buttons.
+            meeting_id = int(show.group(1))
+            reply = _brief_status(meeting_id, *key)
+            if reply is None:
+                await present.show_meeting(adapter, key[0], key[1], meeting_id)
+            else:
+                await _send(adapter, source.chat_id, reply)
+            return {"action": "skip", "reason": "tact-recorder: show brief"}
         if kind == "too_large":
             await _send(adapter, source.chat_id, TOO_LARGE)
             return {"action": "skip", "reason": "tact-recorder: recording too large"}
@@ -318,33 +301,30 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
             logger.info("tact-recorder: meeting #%s received", meeting_id)
             await _send(adapter, source.chat_id, STARTED)
             return {"action": "skip", "reason": "tact-recorder: meeting recording"}
-        replies = _text_replies(_platform(source), str(source.chat_id), text)
-    if replies is None:
-        return None
-    for reply in replies:
-        await _send(adapter, source.chat_id, reply)
+        outcome = _text_replies(*key, text)
+        if outcome is None:
+            return None
+        await present.show_changes(adapter, key[0], key[1], outcome)
     return {"action": "skip", "reason": "tact-recorder: task confirmation"}
 
 
 # -- Telegram buttons ----------------------------------------------------------------------------
 
-def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple[list, str, bool]:
-    """``(replies, toast, finished)`` for a ``rec:`` button press. Only the manager who sent the
-    recording, in the chat it was sent from, can act on its tasks."""
+def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple[Optional[confirm.Outcome], str]:
+    """``(outcome, toast)`` for a ``rec:`` button press. Only the manager who sent the recording, in
+    the chat it was sent from, can act on its tasks."""
     m = _BUTTON_RE.match(data or "")
     if not m:
-        return [], "", False
+        return None, ""
     action, meeting_id, position = _BUTTON_ACTIONS[m.group(1)], int(m.group(2)), int(m.group(3))
     meeting = store.get_meeting(meeting_id, platform, chat_id)
     if meeting is None or meeting["user_id"] != user_id:
-        return [], "Not allowed.", False
-    lang = fmt.lang_of(meeting["language"])
+        return None, "Not allowed."
     if action == "edit" and meeting["status"] == "pending":
         _awaiting_edit[(platform, chat_id)] = (meeting_id, position, time.monotonic() + EDIT_TTL_SECONDS)
-        return [confirm.EDIT_HELP[lang].format(n=position)], "", False
-    replies = confirm.apply(meeting, action, position)
-    finished = store.get_meeting(meeting_id, platform, chat_id)["status"] == "confirmed"
-    return replies, "", finished
+        lang = fmt.lang_of(meeting["language"])
+        return confirm.Outcome(meeting_id, messages=[confirm.EDIT_HELP[lang].format(n=position)]), ""
+    return confirm.apply(meeting, action, position), ""
 
 
 def _telegram_handlers(app: Any, adapter: Any) -> None:
@@ -356,13 +336,12 @@ def _telegram_handlers(app: Any, adapter: Any) -> None:
             accept()
         query = update.callback_query
         chat_id = str(query.message.chat.id)
-        replies, toast, finished = handle_button(query.data, "telegram", chat_id, str(query.from_user.id))
+        outcome, toast = handle_button(query.data, "telegram", chat_id, str(query.from_user.id))
         await query.answer(toast or None)
-        for reply in replies:
-            await _send(adapter, chat_id, reply)
-        if finished:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
+        if outcome is not None:
+            position = int(query.data.rsplit(":", 1)[1])
+            await present.show_changes(adapter, "telegram", chat_id, outcome,
+                                       pressed={position: query.message.message_id})
 
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^rec:"))
 
@@ -397,24 +376,33 @@ def _cmd_recordings(_raw_args: str) -> str:
     return "\n".join(lines)
 
 
+def _brief_status(meeting_id: int, platform: str, chat_id: str) -> Optional[str]:
+    """The reply for a meeting that has no brief to show (unknown, in progress, failed), else None."""
+    meeting = store.get_meeting(meeting_id, platform, chat_id)
+    if meeting is None:
+        return f"No recorded meeting #{meeting_id}. See /recordings."
+    if meeting["brief"]:
+        return None
+    if meeting["status"] == "failed" and meeting["transcript_path"]:
+        return BRIEF_FAILED.format(id=meeting_id)
+    return f"Meeting #{meeting_id}: {_MEETING_STATUS.get(meeting['status'], meeting['status'])}."
+
+
 def _cmd_brief(raw_args: str) -> str:
+    """Only reached where the hook did not show the meeting itself (no private chat): one text."""
     try:
         meeting_id = int(str(raw_args).strip().lstrip("#"))
     except ValueError:
         return "Usage: /brief <id> (see /recordings for ids), or /brief <id> retry in a private chat."
     platform, chat_id = _chat()
+    status = _brief_status(meeting_id, platform, chat_id)
+    if status is not None:
+        return status
     meeting = store.get_meeting(meeting_id, platform, chat_id)
-    if meeting is None:
-        return f"No recorded meeting #{meeting_id}. See /recordings."
-    if not meeting["brief"]:
-        if meeting["status"] == "failed" and meeting["transcript_path"]:
-            return BRIEF_FAILED.format(id=meeting_id)
-        return f"Meeting #{meeting_id}: {_MEETING_STATUS.get(meeting['status'], meeting['status'])}."
-    lang = fmt.lang_of(meeting["language"])
-    text = fmt.brief_text(meeting_id, meeting["created_at"], lang, json.loads(meeting["brief"]),
-                          store.tasks_for(meeting_id), mark=True)
-    if meeting["status"] == "pending":
-        text += "\n\n" + fmt.LABELS[lang]["text_help"]
+    lang, tasks = fmt.lang_of(meeting["language"]), store.tasks_for(meeting_id)
+    text = fmt.brief_text(meeting_id, meeting["created_at"], lang, json.loads(meeting["brief"]), len(tasks), False)
+    if tasks:
+        text += "\n\n" + fmt.combined_text(tasks, lang, with_help=meeting["status"] == "pending")
     return text
 
 

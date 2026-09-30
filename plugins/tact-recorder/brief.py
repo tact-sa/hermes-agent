@@ -31,23 +31,28 @@ class BriefError(Exception):
 
 LABELS = {
     "en": {"summary": "📝 SUMMARY", "decisions": "✅ DECISIONS", "open": "❓ OPEN ISSUES",
-           "tasks": "📋 TASKS", "by_person": "👥 BY PERSON", "missing": "NOT MENTIONED",
-           "unclear": "❓ UNCLEAR", "or": "or", "none": "None", "meeting": "Meeting",
-           "no_tasks": "No tasks were stated in this meeting.",
-           "confirmed_title": "✅ Confirmed tasks", "no_confirmed": "No tasks were confirmed.",
-           "legend": "Confirm the tasks: ✅ confirm · ✏️ edit · ❌ remove",
-           "confirm_all": "✅ Confirm all",
+           "missing": "NOT MENTIONED", "unclear": "❓ UNCLEAR", "or": "or", "none": "None",
+           "meeting": "Meeting", "no_tasks": "📋 No tasks were stated in this meeting.",
+           "tasks_next": "📋 Tasks ({n}) in the following messages",
+           "tasks_below": "📋 Tasks ({n}) in the next message", "tasks_title": "📋 Tasks ({n})",
+           "task_n": "📋 Task {i} of {n}", "confirmed": "✅ Confirmed", "removed": "❌ Removed",
+           "btn_confirm": "✅ Confirm", "btn_edit": "✏️ Edit", "btn_remove": "❌ Remove",
+           "confirm_all": "✅ Confirm all ({n})", "all_prompt": "Confirm all remaining tasks at once:",
+           "all_done": "✅ All tasks handled.",
+           "confirmed_title": "✅ Confirmed tasks — Meeting #{id}", "no_confirmed": "No tasks were confirmed.",
            "text_help": ('Or reply: "confirm all", "confirm 2", "edit 2: Omar, due Sunday", "remove 3".')},
     "ar": {"summary": "📝 الملخص", "decisions": "✅ القرارات", "open": "❓ قضايا مفتوحة",
-           "tasks": "📋 المهام", "by_person": "👥 حسب الشخص", "missing": "غير مذكور",
-           "unclear": "❓ غير واضح", "or": "أو", "none": "لا يوجد", "meeting": "اجتماع",
-           "no_tasks": "لم تُذكر أي مهام في هذا الاجتماع.",
-           "confirmed_title": "✅ المهام المؤكدة", "no_confirmed": "لم يتم تأكيد أي مهمة.",
-           "legend": "أكّد المهام: ✅ تأكيد · ✏️ تعديل · ❌ حذف",
-           "confirm_all": "✅ تأكيد الكل",
+           "missing": "غير مذكور", "unclear": "❓ غير واضح", "or": "أو", "none": "لا يوجد",
+           "meeting": "اجتماع", "no_tasks": "📋 لم تُذكر أي مهام في هذا الاجتماع.",
+           "tasks_next": "📋 المهام ({n}) في الرسائل التالية",
+           "tasks_below": "📋 المهام ({n}) في الرسالة التالية", "tasks_title": "📋 المهام ({n})",
+           "task_n": "📋 مهمة {i} من {n}", "confirmed": "✅ مؤكدة", "removed": "❌ محذوفة",
+           "btn_confirm": "✅ تأكيد", "btn_edit": "✏️ تعديل", "btn_remove": "❌ حذف",
+           "confirm_all": "✅ تأكيد الكل ({n})", "all_prompt": "تأكيد كل المهام المتبقية دفعة واحدة:",
+           "all_done": "✅ تم التعامل مع كل المهام.",
+           "confirmed_title": "✅ المهام المؤكدة — اجتماع #{id}", "no_confirmed": "لم يتم تأكيد أي مهمة.",
            "text_help": 'أو اكتب: "تأكيد الكل"، "تأكيد 2"، "تعديل 2: عمر، الموعد الأحد"، "حذف 3".'},
 }
-STATUS_MARK = {"pending": "⏳", "confirmed": "✅", "removed": "❌"}
 
 INSTRUCTIONS = """\
 You analyse the transcript of a work meeting recorded by a manager. The transcript comes from
@@ -191,6 +196,8 @@ async def analyze(llm: Any, transcript: str, note: str = "",
 
 
 # -- formatting --------------------------------------------------------------------------------
+# One numbering everywhere: a task's number is its position in the meeting. No brackets: "[#3]"
+# renders scrambled inside right-to-left Arabic text.
 
 def owner_text(task: Dict[str, Any], lang: str) -> str:
     if task["person"]:
@@ -203,26 +210,23 @@ def owner_text(task: Dict[str, Any], lang: str) -> str:
     return f"{labels['unclear']}: {joiner.join(cands)}{'؟' if lang == 'ar' else '?'}"
 
 
-def task_line(task: Dict[str, Any], lang: str, mark: bool = False) -> str:
-    prefix = f"{STATUS_MARK.get(task['status'], '')} " if mark else ""
-    deadline = task["deadline"] or LABELS[lang]["missing"]
-    return f"{prefix}{task['position']}. {owner_text(task, lang)} → {task['task']} → {deadline}"
+def task_card(task: Dict[str, Any], total: int, lang: str) -> str:
+    """One task as its own message; a handled task shows its status under it."""
+    labels = LABELS[lang]
+    text = (f"{labels['task_n'].format(i=task['position'], n=total)}\n"
+            f"👤 {owner_text(task, lang)}\n"
+            f"📌 {task['task']}\n"
+            f"📅 {task['deadline'] or labels['missing']}")
+    status = labels.get(task["status"]) if task["status"] in ("confirmed", "removed") else ""
+    return f"{text}\n\n{status}" if status else text
 
 
-def by_person(tasks: List[Dict[str, Any]], lang: str) -> List[str]:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for task in tasks:
-        groups.setdefault(task["person_key"] if task["person"] else "", []).append(task)
-    lines = []
-    # Named people first (in order of first task), unclear owners last.
-    for key in sorted(groups, key=lambda k: k == ""):
-        items = groups[key]
-        who = items[0]["person"] if key else LABELS[lang]["unclear"]
-        missing = LABELS[lang]["missing"]
-        entries = " ".join(f"{i}) {t['task']} ({t['deadline'] or missing}) [#{t['position']}]"
-                           for i, t in enumerate(items, 1))
-        lines.append(f"{who}: {entries}")
-    return lines
+def combined_text(tasks: List[Dict[str, Any]], lang: str, with_help: bool) -> str:
+    """Every task card in one message: many tasks, or no inline buttons on this platform."""
+    labels = LABELS[lang]
+    text = labels["tasks_title"].format(n=len(tasks)) + "\n\n" + "\n\n".join(
+        task_card(t, len(tasks), lang) for t in tasks)
+    return f"{text}\n\n{labels['text_help']}" if with_help else text
 
 
 def _bullets(items: List[str], lang: str) -> str:
@@ -230,21 +234,34 @@ def _bullets(items: List[str], lang: str) -> str:
 
 
 def brief_text(meeting_id: int, created_at: str, lang: str, brief: Dict[str, Any],
-               tasks: List[Dict[str, Any]], mark: bool = False) -> str:
+               n_tasks: int, cards: bool = True) -> str:
+    """Summary, decisions and open issues; the tasks follow in their own message(s)."""
     labels = LABELS[lang]
-    shown = [t for t in tasks if mark or t["status"] != "removed"]
-    parts = [f"🎙️ {labels['meeting']} #{meeting_id} — {created_at[:16].replace('T', ' ')}",
-             f"{labels['summary']}\n" + "\n".join(brief.get("summary") or [labels["none"]]),
-             f"{labels['decisions']}\n{_bullets(brief.get('decisions') or [], lang)}",
-             f"{labels['open']}\n{_bullets(brief.get('open_issues') or [], lang)}"]
-    if shown:
-        parts.append(f"{labels['tasks']}\n" + "\n".join(task_line(t, lang, mark) for t in shown))
-        active = [t for t in shown if t["status"] != "removed"]
-        if active:
-            parts.append(f"{labels['by_person']}\n" + "\n".join(by_person(active, lang)))
+    if not n_tasks:
+        tasks_line = labels["no_tasks"]
     else:
-        parts.append(f"{labels['tasks']}\n{labels['no_tasks']}")
-    return "\n\n".join(parts)
+        tasks_line = labels["tasks_next" if cards else "tasks_below"].format(n=n_tasks)
+    return "\n\n".join([
+        f"🎙️ {labels['meeting']} #{meeting_id} — {created_at[:16].replace('T', ' ')}",
+        f"{labels['summary']}\n" + "\n".join(brief.get("summary") or [labels["none"]]),
+        f"{labels['decisions']}\n{_bullets(brief.get('decisions') or [], lang)}",
+        f"{labels['open']}\n{_bullets(brief.get('open_issues') or [], lang)}",
+        tasks_line])
+
+
+def by_person(tasks: List[Dict[str, Any]], lang: str) -> List[str]:
+    """``👤 name`` blocks, named people first (in order of their first task), unclear owners last."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for task in tasks:
+        groups.setdefault(task["person_key"] if task["person"] else "", []).append(task)
+    missing = LABELS[lang]["missing"]
+    blocks = []
+    for key in sorted(groups, key=lambda k: k == ""):
+        items = groups[key]
+        who = items[0]["person"] if key else LABELS[lang]["unclear"]
+        blocks.append(f"👤 {who}\n" + "\n".join(
+            f"{t['position']}. {t['task']} — {t['deadline'] or missing}" for t in items))
+    return blocks
 
 
 def final_text(meeting_id: int, lang: str, tasks: List[Dict[str, Any]]) -> str:
@@ -252,5 +269,4 @@ def final_text(meeting_id: int, lang: str, tasks: List[Dict[str, Any]]) -> str:
     confirmed = [t for t in tasks if t["status"] == "confirmed"]
     if not confirmed:
         return f"{labels['meeting']} #{meeting_id}: {labels['no_confirmed']}"
-    return (f"{labels['confirmed_title']} — {labels['meeting']} #{meeting_id}\n"
-            + "\n".join(by_person(confirmed, lang)))
+    return labels["confirmed_title"].format(id=meeting_id) + "\n\n" + "\n\n".join(by_person(confirmed, lang))
