@@ -10,6 +10,11 @@ note that nothing transcribes, and a voice note is transcribed into a normal cha
 - it carries a recording: an audio attachment of any kind, a video file sent as a document
   (mp4), or a voice note of at least ``VOICE_MIN_SECONDS`` (shorter ones stay ordinary messages).
 
+``/minutes`` is the explicit trigger: after a bare ``/minutes`` the next audio or voice message in
+that chat within ``MINUTES_TTL_SECONDS`` is a recording whatever its length, and so is a file sent
+with the caption ``/minutes``. The arming is dropped silently when it expires or when the manager
+sends an ordinary text message instead.
+
 The event is then dropped from normal dispatch and processed in the background: the audio moves to
 ``<home>/recordings/<id>/``, is split and transcribed (``audio.py``), the transcript is saved and
 the audio deleted, one structured LLM call writes the brief and extracts the tasks (``brief.py``),
@@ -46,15 +51,19 @@ VOICE_MIN_SECONDS = 180
 TELEGRAM_MAX_BYTES = 20 * 1024 * 1024
 MAX_BUTTON_TASKS = 30  # 3 buttons per task + "Confirm all" stays under Telegram's 100-button cap
 EDIT_TTL_SECONDS = 15 * 60
+MINUTES_TTL_SECONDS = 10 * 60
 
 TOO_LARGE = ("The file is too large for Telegram. Please send an audio-only compressed recording "
              "(e.g. m4a), or split it.")
 STARTED = "🎙️ Transcribing your meeting, this may take a few minutes…"
+MINUTES_READY = "🎙️ Send the meeting recording now."
 
 _LLM: Any = None  # ctx.llm, bound in register()
 _RUNNING: set = set()  # background jobs (kept referenced until done)
 # (platform, chat_id) -> (meeting_id, task position, expiry) after the manager taps ✏️
 _awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, float]] = {}
+# (platform, chat_id) -> expiry after a bare /minutes: the next audio/voice is a recording
+_minutes_armed: Dict[Tuple[str, str], float] = {}
 _BUTTON_RE = re.compile(r"^rec:([acer]):(\d+):(\d+)$")
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove"}
 
@@ -76,8 +85,9 @@ def _is_recording_document(doc: Any) -> bool:
     return mime.startswith(("audio/", "video/")) or Path(name).suffix in SUPPORTED_FORMATS
 
 
-def classify(event: Any, max_bytes: int = TELEGRAM_MAX_BYTES) -> Tuple[str, Optional[str]]:
-    """``("recording", path)``, ``("too_large", None)`` or ``("", None)`` for anything else."""
+def classify(event: Any, max_bytes: int = TELEGRAM_MAX_BYTES, force: bool = False) -> Tuple[str, Optional[str]]:
+    """``("recording", path)``, ``("too_large", None)`` or ``("", None)`` for anything else.
+    ``force`` (the manager asked with /minutes) makes a voice note a recording whatever its length."""
     from gateway.platforms.event import MessageType
 
     kind, att = _attachment(getattr(event, "raw_message", None))
@@ -97,7 +107,7 @@ def classify(event: Any, max_bytes: int = TELEGRAM_MAX_BYTES) -> Tuple[str, Opti
         if is_audio:
             if event.message_type == MessageType.VOICE:
                 duration = int(getattr(att, "duration", 0) or 0) if kind == "voice" else 0
-                return ("recording", path) if duration >= VOICE_MIN_SECONDS else ("", None)
+                return ("recording", path) if force or duration >= VOICE_MIN_SECONDS else ("", None)
             return "recording", path
         if mtype.startswith("video/") and kind == "document":
             return "recording", path
@@ -228,13 +238,21 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
             or not callable(getattr(gateway, "_is_user_authorized_for_source", None))):
         return None
     adapter = _adapter(gateway, source)
-    kind, path = classify(event, int(getattr(adapter, "_max_doc_bytes", 0) or TELEGRAM_MAX_BYTES))
-    text = event.text or ""
-    if not kind and (event.media_urls or not text.strip() or event.get_command()):
+    key = (_platform(source), str(source.chat_id))
+    text, command = event.text or "", event.get_command()
+    has_attachment = bool(event.media_urls) or _attachment(getattr(event, "raw_message", None))[1] is not None
+    force = has_attachment and (command == "minutes" or _minutes_armed.get(key, 0.0) > time.monotonic())
+    kind, path = classify(event, int(getattr(adapter, "_max_doc_bytes", 0) or TELEGRAM_MAX_BYTES), force)
+    # Commands (a bare /minutes included) go on to the gateway's command dispatch.
+    if not kind and (has_attachment or not text.strip() or command):
         return None
     # Only the manager: anyone else continues to the gateway's normal refusal / pairing path.
     if not gateway._is_user_authorized_for_source(source):
         return None
+    # A recording uses up a /minutes arming; an ordinary text message cancels it silently.
+    _minutes_armed.pop(key, None)
+    if command == "minutes":
+        text = event.get_command_args()
     async with _profile_scope(gateway, source):
         if kind == "too_large":
             await _send(adapter, source.chat_id, TOO_LARGE)
@@ -304,6 +322,11 @@ _MEETING_STATUS = {"transcribing": "🎙️ transcribing", "analyzing": "📝 wr
                    "pending": "⏳ awaiting confirmation", "confirmed": "✅ confirmed", "failed": "⚠️ failed"}
 
 
+def _cmd_minutes(_raw_args: str) -> str:
+    _minutes_armed[_chat()] = time.monotonic() + MINUTES_TTL_SECONDS
+    return MINUTES_READY
+
+
 def _cmd_recordings(_raw_args: str) -> str:
     platform, chat_id = _chat()
     rows = store.recent_meetings(platform, chat_id)
@@ -342,6 +365,8 @@ def register(ctx) -> None:
     _LLM = ctx.llm
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_telegram_handler(_telegram_handlers)
+    ctx.register_command("minutes", _cmd_minutes,
+                         description="Take meeting minutes from next audio")
     ctx.register_command("recordings", _cmd_recordings, description="List recent recorded meetings")
     ctx.register_command("brief", _cmd_brief, description="Show a recorded meeting's brief and tasks",
                          args_hint="<id>")

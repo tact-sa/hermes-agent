@@ -277,3 +277,54 @@ def test_confirm_edit_remove_flow_with_text_replies_and_buttons(recorder, monkey
     assert f"#{meeting_id}" in listing and "✅ confirmed" in listing
     shown = mod._cmd_brief(str(meeting_id))
     assert "✅ 1. Ahmad → Send the Q3 budget → Sunday" in shown and "❌ 3." in shown
+
+
+def _short_voice(tmp_path, name, text=""):
+    return _event(text=text, message_type="VOICE", media=[_wav(tmp_path / name, 1)], mime="audio/ogg",
+                  raw=SimpleNamespace(voice=SimpleNamespace(duration=20, file_size=9000)))
+
+
+def test_minutes_makes_the_next_short_voice_note_or_a_captioned_file_a_recording(recorder, tmp_path, monkeypatch):
+    from hermes_cli.commands_platforms import telegram_menu_commands
+    from hermes_cli.plugins import get_plugin_command_handler
+    mod = recorder
+    stt_calls = _fake_stt(monkeypatch, ["first meeting", "second meeting"])
+    llm = FakeLlm(ANALYSIS)
+    monkeypatch.setattr(mod, "_LLM", llm)
+    gw = FakeGateway()
+
+    assert "minutes" in dict(telegram_menu_commands()[0])  # in the Telegram command menu
+    assert get_plugin_command_handler("minutes")("") == "🎙️ Send the meeting recording now."
+    first = _short_voice(tmp_path, "a.ogg")
+    assert _dispatch(mod, gw, first) is None
+    assert gw.adapter.sent[0] == mod.STARTED and len(stt_calls) == 1
+    # The arming is used up: the next short voice note is an ordinary message again.
+    again = _short_voice(tmp_path, "b.ogg")
+    assert _dispatch(mod, gw, again) is again and len(stt_calls) == 1
+
+    # A file captioned /minutes needs no arming; the rest of the caption is the manager's note.
+    captioned = _short_voice(tmp_path, "c.ogg", text="/minutes weekly sync")
+    assert _dispatch(mod, gw, captioned) is None and len(stt_calls) == 2
+    note = llm.calls[-1]["input"][0]["text"]
+    assert "weekly sync" in note and "/minutes" not in note
+    assert [r["id"] for r in mod.store.recent_meetings("telegram", CHAT)] == [2, 1]
+
+
+def test_minutes_is_cancelled_by_a_text_message_or_after_ten_minutes(recorder, tmp_path, monkeypatch):
+    mod = recorder
+    stt_calls = _fake_stt(monkeypatch, ["unused"])
+    gw = FakeGateway()
+
+    mod._cmd_minutes("")
+    hello = _event(text="Remind me to call Khalid at 3", message_type="TEXT")
+    assert _dispatch(mod, gw, hello) is hello  # passes to the agent, silently cancelling /minutes
+    voice = _short_voice(tmp_path, "a.ogg")
+    assert _dispatch(mod, gw, voice) is voice
+
+    mod._cmd_minutes("")
+    armed_until = mod._minutes_armed[("telegram", CHAT)]
+    assert armed_until - mod.time.monotonic() > mod.MINUTES_TTL_SECONDS - 5
+    mod._minutes_armed[("telegram", CHAT)] = armed_until - mod.MINUTES_TTL_SECONDS - 1  # ten minutes pass
+    late = _short_voice(tmp_path, "b.ogg")
+    assert _dispatch(mod, gw, late) is late
+    assert not stt_calls and not gw.adapter.sent
