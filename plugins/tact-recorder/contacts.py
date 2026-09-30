@@ -13,7 +13,8 @@ Phones are stored but cannot be messaged yet.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, NamedTuple, Optional
+import re
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from . import brief as fmt
 from . import store
@@ -27,7 +28,48 @@ def _connect():
         " name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, aliases TEXT NOT NULL DEFAULT '[]',"
         " telegram_chat_id TEXT, telegram_username TEXT, email TEXT, phone TEXT,"
         " updated_at TEXT NOT NULL)")
+    # Names the manager removed (/contacts delete) that live on in past tasks: kept out of pickers.
+    con.execute("CREATE TABLE IF NOT EXISTS hidden_names (name_key TEXT PRIMARY KEY)")
     return con
+
+
+# A person's name, not a placeholder the model or the manager wrote while unsure ("احمد او عمر
+# (يحدد لاحقا)", "فهد او نورة", "Sara / Omar") and not a phrase.
+_NOT_A_NAME_RE = re.compile(r"(?:^|\s)(?:او|أو|or)(?:\s|$)|[/\\()\[\]{}<>؟?]", re.IGNORECASE)
+MAX_NAME_WORDS = 3
+
+
+def is_person_name(name: str) -> bool:
+    name = fmt.clean(name)
+    return bool(name) and len(name.split()) <= MAX_NAME_WORDS and not _NOT_A_NAME_RE.search(name)
+
+
+def _hidden() -> set:
+    with _connect() as con:
+        return {r["name_key"] for r in con.execute("SELECT name_key FROM hidden_names").fetchall()}
+
+
+def _set_hidden(name: str, hidden: bool) -> None:
+    with _connect() as con:
+        if hidden:
+            con.execute("INSERT OR IGNORE INTO hidden_names (name_key) VALUES (?)", (fmt.name_key(name),))
+        else:
+            con.execute("DELETE FROM hidden_names WHERE name_key = ?", (fmt.name_key(name),))
+
+
+def picker_names(platform: str, chat_id: str, limit: int = 12) -> List[str]:
+    """Names to offer on buttons (e.g. join approval): the contacts book first, then owners of
+    confirmed tasks from recent meetings; placeholders, phrases and removed names left out; one
+    button per person (``brief.name_key``)."""
+    hidden = _hidden()
+    names = [r["name"] for r in all_contacts()]
+    names += [n for person in store.recent_people(platform, chat_id) for n in fmt.split_owners(person)]
+    unique: Dict[str, str] = {}
+    for name in names:
+        key = fmt.name_key(name)
+        if is_person_name(name) and key not in hidden:
+            unique.setdefault(key, fmt.clean(name))
+    return list(unique.values())[:limit]
 
 
 def all_contacts() -> List[Dict[str, Any]]:
@@ -58,6 +100,7 @@ def by_chat_id(chat_id: str) -> Optional[Dict[str, Any]]:
 
 def _upsert(name: str, **fields: Any) -> None:
     fields["updated_at"] = store.now().isoformat(timespec="seconds")
+    _set_hidden(name, False)  # a person the manager gives a contact to is back in the pickers
     row = find(name)
     with _connect() as con:
         if row is None:
@@ -89,13 +132,44 @@ def link_telegram(name: str, chat_id: str, username: str = "") -> None:
     _upsert(name, **fields)
 
 
+def _in_past_tasks(name: str) -> bool:
+    key = fmt.name_key(name)
+    with store.connect() as con:
+        people = [r["person"] for r in con.execute("SELECT DISTINCT person FROM tasks WHERE person != ''")]
+    return any(fmt.name_key(n) == key for person in people for n in fmt.split_owners(person))
+
+
 def delete(name: str) -> bool:
+    """Remove *name* from the book and from every name picker (past tasks keep their text);
+    False when the name is neither in the book nor in any task."""
     row = find(name)
-    if row is None:
-        return False
-    with _connect() as con:
-        con.execute("DELETE FROM contacts WHERE id = ?", (row["id"],))
-    return True
+    known = row is not None or _in_past_tasks(name)
+    if row is not None:
+        with _connect() as con:
+            con.execute("DELETE FROM contacts WHERE id = ?", (row["id"],))
+    if known:
+        _set_hidden(name, True)
+    return known
+
+
+def rename(old: str, new: str) -> Tuple[bool, str]:
+    """Fix a person's name in the book and in past tasks: ``(done, message)``."""
+    old, new = fmt.clean(old), fmt.clean(new)
+    if not is_person_name(new):
+        return False, f"«{new}» ليس اسماً صالحاً."
+    row, target = find(old), find(new)
+    if row is not None and target is not None and target["id"] != row["id"]:
+        return False, f"{new} موجود بالفعل في جهات الاتصال."
+    tasks = store.rename_person(fmt.name_key(old), new, fmt.name_key, fmt.split_owners)
+    if row is None and not tasks:
+        return False, f"لا يوجد اسم {old}."
+    if row is not None:
+        with _connect() as con:
+            con.execute("UPDATE contacts SET name = ?, name_key = ?, updated_at = ? WHERE id = ?",
+                        (new, fmt.name_key(new), store.now().isoformat(timespec="seconds"), row["id"]))
+    _set_hidden(old, True)
+    _set_hidden(new, False)
+    return True, f"✏️ أُعيدت تسمية {old} إلى {new}" + (f" (في {tasks} مهمة)" if tasks else "") + "."
 
 
 def has_value(name: str, contact: str) -> bool:
@@ -182,5 +256,5 @@ def list_text() -> str:
     lines = [f"👥 جهات الاتصال ({len(rows)}):"]
     for row in rows:
         lines.append(f"• {row['name']} — {row_text(row, 'ar') or 'غير معروف'}")
-    lines.append("لحذف جهة: /contacts delete <الاسم>")
+    lines.append("لحذف جهة: /contacts delete <الاسم> · لتصحيح اسم: /contacts rename <القديم> -> <الجديد>")
     return "\n".join(lines)

@@ -9,6 +9,7 @@ task was sent to its owner.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -118,15 +119,45 @@ def latest_briefed(platform: str, chat_id: str) -> Optional[sqlite3.Row]:
 
 
 def recent_people(platform: str, chat_id: str, meetings: int = 10) -> List[str]:
-    """Names from the chat's latest meetings (owners, and the candidates of unclear tasks), most
-    recent first; joint owners stay joined ("أحمد، عمر")."""
+    """Owners of CONFIRMED tasks in the chat's latest meetings, most recent first. Unclear owners
+    (candidates), pending and cancelled tasks are left out; joint owners stay joined ("أحمد، عمر")."""
     with connect() as con:
         rows = con.execute(
-            "SELECT t.person, t.candidates FROM tasks t JOIN meetings m ON m.id = t.meeting_id"
-            " WHERE m.platform = ? AND m.chat_id = ?"
+            "SELECT t.person FROM tasks t JOIN meetings m ON m.id = t.meeting_id"
+            " WHERE m.platform = ? AND m.chat_id = ? AND t.status = 'confirmed' AND t.person != ''"
             " AND m.id IN (SELECT id FROM meetings WHERE platform = ? AND chat_id = ? ORDER BY id DESC LIMIT ?)"
             " ORDER BY m.id DESC, t.position", (platform, chat_id, platform, chat_id, meetings)).fetchall()
-    return [n for r in rows for n in ([r["person"]] if r["person"] else json.loads(r["candidates"] or "[]"))]
+    return [r["person"] for r in rows]
+
+
+def delete_meeting(meeting_id: int) -> None:
+    """The meeting, its tasks and its folder (transcript, any leftover audio)."""
+    with connect() as con:
+        con.execute("DELETE FROM tasks WHERE meeting_id = ?", (meeting_id,))
+        con.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+    shutil.rmtree(recordings_dir() / str(meeting_id), ignore_errors=True)
+
+
+def meeting_ids(platform: str, chat_id: str, user_id: str) -> List[int]:
+    with connect() as con:
+        return [r["id"] for r in con.execute(
+            "SELECT id FROM meetings WHERE platform = ? AND chat_id = ? AND user_id = ? ORDER BY id",
+            (platform, chat_id, str(user_id))).fetchall()]
+
+
+def rename_person(old_key: str, new_name: str, key_of, split) -> int:
+    """Rename one person in every task's owner (joint owners included); returns tasks changed.
+    ``key_of`` / ``split`` are ``brief.name_key`` / ``brief.split_owners``."""
+    changed = 0
+    with connect() as con:
+        for row in con.execute("SELECT id, person FROM tasks WHERE person != ''").fetchall():
+            names = split(row["person"])
+            if not any(key_of(n) == old_key for n in names):
+                continue
+            person = "، ".join(dict.fromkeys(new_name if key_of(n) == old_key else n for n in names))
+            con.execute("UPDATE tasks SET person = ?, person_key = ? WHERE id = ?", (person, key_of(person), row["id"]))
+            changed += 1
+    return changed
 
 
 def recent_meetings(platform: str, chat_id: str, limit: int = 10) -> List[sqlite3.Row]:

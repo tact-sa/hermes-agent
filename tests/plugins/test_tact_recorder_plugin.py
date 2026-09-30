@@ -845,7 +845,9 @@ def _join(mod, adapter, token, user=555, username="fahad", name="Fahad K"):
 
 def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub):
     mod = recorder
-    _seed(mod)  # a meeting with Ahmad and Omar gives the name buttons
+    meeting_id = _seed(mod)
+    mod.store.set_task_status(meeting_id, [1], "confirmed")  # Ahmad, a confirmed owner
+    mod.contacts.save_contact("Omar", "omar@tact.sa")  # the contacts book comes first
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
     token = _invite(mod, gw)
@@ -859,11 +861,11 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     assert request_text == "📥 Fahad K (@fahad, 555) يريد استقبال المهام. اربطه بـ:"
     request_id = max(bot.messages)
     labels = [b for row in _buttons(bot.messages[request_id][1]) for b, _ in row]
-    assert labels[:2] == ["Ahmad", "Omar"] and labels[-2:] == ["➕ اسم آخر", "❌ رفض"]
+    assert labels == ["Omar", "Ahmad", "➕ اسم آخر", "❌ رفض"]
     assert mod.contacts.by_chat_id("555") is None  # nothing registered before the manager decides
     # Never matched by display name, and nobody but the manager can decide.
-    assert _press(mod, gw.adapter, "rec:j:a:1:1", request_id, user="555") == ["Not allowed."]
-    _press(mod, gw.adapter, "rec:j:a:1:1", request_id)
+    assert _press(mod, gw.adapter, "rec:j:a:1:0", request_id, user="555") == ["Not allowed."]
+    _press(mod, gw.adapter, "rec:j:a:1:0", request_id)
     assert mod.contacts.find("Omar")["telegram_chat_id"] == "555"
     assert bot.sent_to(555)[-1] == "✅ تم تسجيلك لاستقبال المهام."
     assert bot.messages[request_id] == ("✅ تم ربط Fahad K (@fahad, 555) بـ Omar.", None)
@@ -908,6 +910,7 @@ def test_rejected_expired_revoked_and_rate_limited_joins(recorder, telegram_stub
 def test_a_registered_member_can_use_nothing_else(recorder, telegram_stub, tmp_path):
     mod = recorder
     meeting_id = _seed(mod)
+    mod.store.set_task_status(meeting_id, [1], "confirmed")
     gw = FakeGateway(bot=True)
     token = _invite(mod, gw)
     _join(mod, gw.adapter, token, user=555)
@@ -1024,3 +1027,70 @@ def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub
     assert FakeSMTP.logins == [("bot@tact.sa", "app-secret-pw", True)]  # STARTTLS before login
     assert mod.store.tasks_for(meeting_id)[4]["sent_via"] == "telegram,email"
     assert "app-secret-pw" not in caplog.text and "Send the deck" not in caplog.text
+
+
+def test_name_pickers_offer_only_real_confirmed_people(recorder):
+    mod = recorder
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    rows = [("Omar", []), ("احمد او عمر (يحدد لاحقا)", []), ("فهد او نورة", []), ("Sara / Omar", []),
+            ("Khalid", []), ("Nasser", []), ("", ["Ali", "Hassan"]), ("عمر، Layla", []), ("Abdul Rahman Al Saud", []),
+            ("سره", [])]
+    mod.store.save_analysis(meeting_id, "ar", {"summary": []}, [
+        {"person": p, "person_key": mod.brief.name_key(p), "candidates": c, "task": f"t{i}", "deadline": ""}
+        for i, (p, c) in enumerate(rows, 1)])
+    mod.store.set_task_status(meeting_id, [1, 2, 3, 4, 7, 8, 9], "confirmed")  # Khalid pending, Nasser, سره
+    mod.store.set_task_status(meeting_id, [6, 10], "removed")                   # cancelled
+    mod.contacts.save_contact("فهد", "fahad@tact.sa")
+    picker = mod.contacts.picker_names  # contacts book first, then confirmed owners; one per person
+    assert picker("telegram", CHAT) == ["فهد", "Omar", "عمر", "Layla"]
+    assert mod.contacts.is_person_name("عبد الله") and not mod.contacts.is_person_name("Omar or Sara")
+
+    # /contacts delete also hides a name that only lives in past tasks; rename fixes it everywhere.
+    assert mod._cmd_contacts("delete Layla") == "🗑️ حُذف Layla."
+    assert mod._cmd_contacts("delete Nobody") == "لا توجد جهة اتصال باسم Nobody."
+    assert mod._cmd_contacts("rename Omar -> عمر") == "✏️ أُعيدت تسمية Omar إلى عمر (في 1 مهمة)."
+    assert picker("telegram", CHAT) == ["فهد", "عمر"]
+    # Only real owner names are renamed; a placeholder like "Sara / Omar" is left as it was.
+    assert [t["person"] for t in mod.store.tasks_for(meeting_id)][:4] == ["عمر", "احمد او عمر (يحدد لاحقا)",
+                                                                         "فهد او نورة", "Sara / Omar"]
+    assert mod._cmd_contacts("rename فهد → Fahad").startswith("✏️ أُعيدت تسمية فهد إلى Fahad")
+    assert mod.contacts.find("Fahad")["email"] == "fahad@tact.sa" and picker("telegram", CHAT)[0] == "Fahad"
+    assert mod._cmd_contacts("rename Fahad -> x / y") == "«x / y» ليس اسماً صالحاً."
+
+
+def test_recordings_delete_and_clear_need_confirmation(recorder, telegram_stub, monkeypatch):
+    mod = recorder
+    first, second, third = _seed(mod), _seed(mod), _seed(mod)
+    for number in (first, second, third):
+        (mod.store.meeting_dir(number) / "transcript.txt").write_text("secret words", encoding="utf-8")
+        mod.store.update_meeting(number, transcript_path=str(mod.store.meeting_dir(number) / "transcript.txt"))
+    mod.contacts.save_contact("Omar", "omar@tact.sa")
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    folder = Path(mod.store.recordings_dir())
+
+    assert _dispatch(mod, gw, _event(text=f"/recordings delete {first}", message_type="TEXT")) is None
+    question = max(bot.messages)
+    assert bot.messages[question][0] == f"🗑️ حذف الاجتماع #{first} ومهامه ونصّه نهائياً؟"
+    assert mod.store.get_meeting(first, "telegram", CHAT) is not None  # nothing deleted before ✅
+    assert _press(mod, gw.adapter, f"rec:d:y:{first}", question, user="99") == ["Not allowed."]
+    _press(mod, gw.adapter, f"rec:d:n:{first}", question)
+    assert bot.messages[question] == ("لم يُحذف شيء.", None) and (folder / str(first)).exists()
+
+    assert _dispatch(mod, gw, _event(text=f"/recordings delete {first}", message_type="TEXT")) is None
+    _press(mod, gw.adapter, f"rec:d:y:{first}", max(bot.messages))
+    assert mod.store.get_meeting(first, "telegram", CHAT) is None and mod.store.tasks_for(first) == []
+    assert not (folder / str(first)).exists()
+    assert mod.store.get_meeting(second, "telegram", CHAT) is not None
+
+    # Without buttons: the command asks for an explicit "confirm".
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", MANAGER)
+    assert mod._cmd_recordings(f"delete {second}") == f"للتأكيد أرسل: /recordings delete {second} confirm"
+    assert mod._cmd_recordings(f"delete {second} confirm") == f"🗑️ حُذف الاجتماع #{second}."
+    assert not (folder / str(second)).exists()
+
+    assert _dispatch(mod, gw, _event(text="/recordings clear", message_type="TEXT")) is None
+    assert "كل الاجتماعات المسجّلة (1)" in bot.messages[max(bot.messages)][0]
+    _press(mod, gw.adapter, "rec:d:y:0", max(bot.messages))
+    assert mod.store.recent_meetings("telegram", CHAT) == [] and not (folder / str(third)).exists()
+    assert mod.contacts.find("Omar")["email"] == "omar@tact.sa"  # the contacts book is kept

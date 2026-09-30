@@ -127,13 +127,7 @@ def _valid_invite(token: str) -> Optional[Any]:
 
 
 def _name_options(invite: Any) -> List[str]:
-    names = [r["name"] for r in contacts.all_contacts()]
-    for person in store.recent_people(invite["creator_platform"], invite["creator_chat_id"]):
-        names += fmt.split_owners(person)
-    unique: Dict[str, str] = {}
-    for name in names:
-        unique.setdefault(fmt.name_key(name), name)
-    return list(unique.values())[:MAX_NAME_BUTTONS]
+    return contacts.picker_names(invite["creator_platform"], invite["creator_chat_id"], MAX_NAME_BUTTONS)
 
 
 def _request_markup(request_id: int, options: List[str]) -> Any:
@@ -244,7 +238,10 @@ async def take_typed_name(bot: Any, platform: str, chat_id: str, user_id: str, t
         return None
     request = get_request(waiting[0])
     name = fmt.clean(text)
-    if not _may_decide(request, chat_id, user_id) or not name:
+    if not _may_decide(request, chat_id, user_id):
         return ["لم يتم الربط."]
+    if not contacts.is_person_name(name):  # a placeholder like "احمد او عمر" is not a person
+        awaiting_name[(platform, str(chat_id))] = waiting
+        return [f"«{name}» ليس اسم شخص. اكتب اسماً واحداً (ثلاث كلمات على الأكثر)."]
     await approve(bot, request, name)
     return []

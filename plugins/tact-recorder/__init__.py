@@ -79,7 +79,9 @@ _awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, str, float]] = {}
 _minutes_armed: Dict[Tuple[str, str], float] = {}
 _BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntdk]))?$")
 # rec:x:<p|s|c>:<meeting> sending, rec:s:<y|n>:<meeting>:<task> save contact, rec:j:<a|o|r>:<request>[:<i>] join
-_EXTRA_RE = re.compile(r"^rec:([xsj]):([a-z]):(\d+)(?::(\d+))?$")
+# rec:d:<y|n>:<meeting, 0 = all> delete recordings
+_EXTRA_RE = re.compile(r"^rec:([xsjd]):([a-z]):(\d+)(?::(\d+))?$")
+_DELETE_RE = re.compile(r"^(?:delete|remove|حذف)\s+#?(\d+)(\s+confirm)?$|^(clear)(\s+confirm)?$", re.IGNORECASE)
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back"}
 _BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline", "k": "contact"}
 _INVITE_RE = re.compile(r"^(?:revoke|cancel|إلغاء|الغاء)?$", re.IGNORECASE)
@@ -284,8 +286,15 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
     retry, show = _RETRY_RE.match(brief_args), _SHOW_RE.match(brief_args)
     invite_cmd = (command == "invite" and not has_attachment and key[0] == "telegram"
                   and _INVITE_RE.match(event.get_command_args().strip()))
+    # "/recordings delete <id>" / "/recordings clear" ask with buttons (the "... confirm" form, for
+    # chats without buttons, goes to the command itself).
+    delete_cmd = (command == "recordings" and not has_attachment and getattr(adapter, "_bot", None) is not None
+                  and key[0] == "telegram" and _DELETE_RE.match(event.get_command_args().strip()))
+    if delete_cmd and (delete_cmd.group(2) or delete_cmd.group(4)):
+        delete_cmd = None
     # Other commands (a bare /minutes included) go on to the gateway's command dispatch.
-    if not kind and not retry and not show and not invite_cmd and (has_attachment or not text.strip() or command):
+    if (not kind and not retry and not show and not invite_cmd and not delete_cmd
+            and (has_attachment or not text.strip() or command)):
         return None
     # Only the manager: anyone else continues to the gateway's normal refusal / pairing path.
     if not gateway._is_user_authorized_for_source(source):
@@ -295,6 +304,9 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
     if command == "minutes":
         text = event.get_command_args()
     async with _profile_scope(gateway, source):
+        if delete_cmd:
+            await _ask_delete(adapter, source, int(delete_cmd.group(1) or 0))
+            return {"action": "skip", "reason": "tact-recorder: delete recordings"}
         if invite_cmd:
             await _send(adapter, source.chat_id, _invite_reply(adapter, source, invite_cmd.group(0)))
             return {"action": "skip", "reason": "tact-recorder: invite"}
@@ -361,6 +373,35 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
     return confirm.apply(meeting, action, position), ""
 
 
+def _delete_question(meeting_id: int, platform: str, chat_id: str, user_id: str) -> Optional[str]:
+    """What deleting would remove, or None when there is nothing of this manager's to delete."""
+    if meeting_id:
+        meeting = sending.resolve_meeting(meeting_id, platform, chat_id, user_id)
+        return None if meeting is None else f"🗑️ حذف الاجتماع #{meeting_id} ومهامه ونصّه نهائياً؟"
+    count = len(store.meeting_ids(platform, chat_id, user_id))
+    return (f"🗑️ حذف كل الاجتماعات المسجّلة ({count}) ومهامها ونصوصها نهائياً؟ دفتر جهات الاتصال يبقى كما هو."
+            if count else None)
+
+
+def _delete(meeting_id: int, platform: str, chat_id: str, user_id: str) -> str:
+    ids = [meeting_id] if meeting_id else store.meeting_ids(platform, chat_id, user_id)
+    for number in ids:
+        store.delete_meeting(number)
+    logger.info("tact-recorder: %d meeting(s) deleted by the manager", len(ids))
+    return f"🗑️ حُذف الاجتماع #{meeting_id}." if meeting_id else f"🗑️ حُذفت كل الاجتماعات ({len(ids)})."
+
+
+async def _ask_delete(adapter: Any, source: Any, meeting_id: int) -> None:
+    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
+    question = _delete_question(meeting_id, _platform(source), str(source.chat_id), str(source.user_id))
+    if question is None:
+        await _send(adapter, source.chat_id, f"لا يوجد اجتماع #{meeting_id}." if meeting_id else "لا توجد اجتماعات.")
+        return
+    await adapter._bot.send_message(chat_id=present._chat_arg(source.chat_id), text=question, reply_markup=(
+        InlineKeyboardMarkup([[Button("✅ حذف", callback_data=f"rec:d:y:{meeting_id}"),
+                               Button("❌ إلغاء", callback_data=f"rec:d:n:{meeting_id}")]])))
+
+
 def _invite_reply(adapter: Any, source: Any, args: str) -> str:
     if args:
         return f"🚫 أُلغيت روابط الدعوة النشطة ({invite.revoke_invites(str(source.user_id))})."
@@ -380,6 +421,12 @@ async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: st
         return ""
     kind, action, number, extra = m.group(1), m.group(2), int(m.group(3)), int(m.group(4) or 0)
     bot = getattr(adapter, "_bot", None)
+    if kind == "d":  # only the manager whose meetings they are; nothing is deleted without ✅
+        if _delete_question(number, "telegram", chat_id, user_id) is None:
+            return "Not allowed."
+        text = _delete(number, "telegram", chat_id, user_id) if action == "y" else "لم يُحذف شيء."
+        await present._edit(bot, chat_id, message_id, text, None)
+        return ""
     if kind == "j":
         messages, toast = await invite.handle_button(bot, action, number, extra, chat_id, user_id)
         for text in messages:
@@ -474,6 +521,9 @@ def _cmd_invite(_raw_args: str) -> str:
 
 def _cmd_contacts(raw_args: str) -> str:
     args = str(raw_args or "").strip()
+    renamed = re.match(r"^(?:rename|تسمية|إعادة تسمية)\s+(.+?)\s*(?:->|→|=>|>)\s*(.+)$", args, re.IGNORECASE)
+    if renamed:
+        return contacts.rename(renamed.group(1), renamed.group(2))[1]
     m = re.match(r"^(?:delete|remove|حذف|احذف)\s+(.+)$", args, re.IGNORECASE)
     if m:
         name = fmt.clean(m.group(1))
@@ -486,8 +536,18 @@ def _cmd_minutes(_raw_args: str) -> str:
     return MINUTES_READY
 
 
-def _cmd_recordings(_raw_args: str) -> str:
+def _cmd_recordings(raw_args: str) -> str:
     platform, chat_id = _chat()
+    m = _DELETE_RE.match(str(raw_args or "").strip())
+    if m:
+        from gateway.session_context import get_session_env
+        user_id = get_session_env("HERMES_SESSION_USER_ID")
+        meeting_id = int(m.group(1) or 0)
+        if _delete_question(meeting_id, platform, chat_id, user_id) is None:
+            return f"لا يوجد اجتماع #{meeting_id}." if meeting_id else "لا توجد اجتماعات."
+        if not (m.group(2) or m.group(4)):  # no buttons here: an explicit "confirm" is required
+            return f"للتأكيد أرسل: /recordings {'delete ' + str(meeting_id) if meeting_id else 'clear'} confirm"
+        return _delete(meeting_id, platform, chat_id, user_id)
     rows = store.recent_meetings(platform, chat_id)
     if not rows:
         return "🎙️ No recorded meetings yet. Send a meeting recording to start."
@@ -544,6 +604,7 @@ def register(ctx) -> None:
     ctx.register_command("invite", _cmd_invite,
                          description="Invite link so a team member can receive tasks")
     ctx.register_command("contacts", _cmd_contacts, description="Who can receive tasks, and how")
-    ctx.register_command("recordings", _cmd_recordings, description="List recent recorded meetings")
+    ctx.register_command("recordings", _cmd_recordings,
+                         description="List recorded meetings (delete <id> / clear)")
     ctx.register_command("brief", _cmd_brief, description="Show a recorded meeting's brief and tasks",
                          args_hint="<id>")
