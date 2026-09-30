@@ -858,7 +858,8 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     _join(mod, gw.adapter, token)
     assert bot.sent_to(555) == ["⏳ طلبك بانتظار موافقة المدير."]
     (request_text,) = bot.sent_to(CHAT)
-    assert request_text == "📥 Fahad K (@fahad, 555) يريد استقبال المهام. اربطه بـ:"
+    assert request_text.startswith("📥 طلب انضمام\n👤 الاسم في تيليجرام: Fahad K\n🔗 @fahad\n🆔 555\n🕒 ")
+    assert "— عبر رابط أنشأته الساعة " in request_text and request_text.endswith("\nاربطه بـ:")
     request_id = max(bot.messages)
     labels = [b for row in _buttons(bot.messages[request_id][1]) for b, _ in row]
     assert labels == ["Omar", "Ahmad", "➕ اسم آخر", "❌ رفض"]
@@ -869,15 +870,35 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     assert mod.contacts.find("Omar")["telegram_chat_id"] == "555"
     assert bot.sent_to(555)[-1] == "✅ تم تسجيلك لاستقبال المهام."
     assert bot.messages[request_id] == ("✅ تم ربط Fahad K (@fahad, 555) بـ Omar.", None)
+    # Then: full name and role, each typed (or skipped).
+    question = max(bot.messages)
+    assert bot.messages[question][0] == "الاسم الكامل؟ (Omar)"
+    assert _buttons(bot.messages[question][1]) == [[("تخطي", "rec:j:k:1")]]
+    assert _dispatch(mod, gw, _event(text="عمر الحربي", message_type="TEXT")) is None
+    assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (Omar)"
+    assert _dispatch(mod, gw, _event(text="مطور", message_type="TEXT")) is None
+    assert bot.messages[max(bot.messages)][0] == "✅ اكتمل تسجيل عمر الحربي (مطور)."
+    omar = mod.contacts.find("Omar")
+    assert (omar["full_name"], omar["role"]) == ("عمر الحربي", "مطور")
+    assert mod.contacts.find("عمر الحربي")["id"] == omar["id"]  # meetings may say the full name too
 
-    # "➕ اسم آخر": the manager types the name.
+    # "➕ اسم آخر": the manager types the name; both details skipped. Labels show "full name (role)".
     _join(mod, gw.adapter, token, user=556, username="", name="Sara")
     other = max(bot.messages)
+    assert "🔗 بدون اسم مستخدم" in bot.messages[other][0]
+    assert [b for row in _buttons(bot.messages[other][1]) for b, _ in row][0] == "عمر الحربي (مطور)"
     _press(mod, gw.adapter, "rec:j:o:2", other)
     assert _dispatch(mod, gw, _event(text="سارة", message_type="TEXT")) is None
     assert mod.contacts.find("سارة")["telegram_chat_id"] == "556"
+    assert mod.contacts.find("Omar")["full_name"] == "عمر الحربي"  # the typed name was not a detail
+    _press(mod, gw.adapter, "rec:j:k:2", max(bot.messages))
+    assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (سارة)"
+    _press(mod, gw.adapter, "rec:j:k:2", max(bot.messages))
+    sara = mod.contacts.find("سارة")
+    assert (sara["full_name"], sara["role"]) == (None, None)
     assert "سارة — ✅ تيليجرام" in mod._cmd_contacts("")
-    assert mod._cmd_contacts("delete سارة") == "🗑️ حُذف سارة." and mod.contacts.find("سارة") is None
+    assert mod._cmd_contacts("delete سارة") == "للتأكيد أرسل: /contacts delete سارة confirm"
+    assert mod._cmd_contacts("delete سارة confirm") == "🗑️ حُذف سارة." and mod.contacts.find("سارة") is None
 
 
 def test_rejected_expired_revoked_and_rate_limited_joins(recorder, telegram_stub, monkeypatch):
@@ -1094,3 +1115,126 @@ def test_recordings_delete_and_clear_need_confirmation(recorder, telegram_stub, 
     _press(mod, gw.adapter, "rec:d:y:0", max(bot.messages))
     assert mod.store.recent_meetings("telegram", CHAT) == [] and not (folder / str(third)).exists()
     assert mod.contacts.find("Omar")["email"] == "omar@tact.sa"  # the contacts book is kept
+
+
+def test_join_request_comes_with_the_profile_photo_when_there_is_one(recorder, telegram_stub):
+    mod = recorder
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    photos = []
+
+    async def get_user_profile_photos(user_id, limit=1):
+        return SimpleNamespace(photos=[[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="big")]]
+                               if user_id == 555 else [])
+
+    async def send_photo(chat_id, photo):
+        photos.append((str(chat_id), photo))
+        bot.messages[-len(photos)] = ("<photo>", None)  # keep message order visible
+    bot.get_user_profile_photos, bot.send_photo = get_user_profile_photos, send_photo
+    token = _invite(mod, gw)
+    _join(mod, gw.adapter, token, user=555)
+    assert photos == [(CHAT, "big")]  # the largest size, to the manager, before the request text
+    _join(mod, gw.adapter, token, user=556)
+    assert photos == [(CHAT, "big")] and len(bot.sent_to(CHAT)) == 2  # no photo: silently none
+
+
+def _two_fahads(mod):
+    mod.contacts.link_telegram("فهد", "801", "fahad_dev")
+    mod.contacts.set_details("فهد", full_name="فهد العتيبي", role="مطور")
+    mod.contacts.link_telegram("فهد ش", "802")
+    mod.contacts.set_details("فهد ش", full_name="فهد الشمري", role="مالية")
+
+
+def test_a_shared_first_name_is_asked_not_guessed(recorder, telegram_stub, monkeypatch):
+    mod = recorder
+    for var in mod.sending.SMTP_VARS:
+        monkeypatch.delenv(var, raising=False)
+    _two_fahads(mod)
+    assert [r["full_name"] for r in mod.contacts.matches("فهد")] == ["فهد العتيبي", "فهد الشمري"]
+    assert mod.contacts.find("فهد") is None and mod.contacts.find("فهد الشمري")["name"] == "فهد ش"
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, "ar", {"summary": []}, [
+        {"person": p, "person_key": mod.brief.name_key(p), "candidates": [], "task": t, "deadline": ""}
+        for p, t in (("فهد", "مراجعة الكود"), ("فهد الشمري", "إعداد الفاتورة"))])
+    mod.store.set_task_status(meeting_id, [1, 2], "confirmed")
+    mod.store.update_meeting(meeting_id, status="confirmed")
+    card = mod.brief.task_card(mod.contacts.annotate(mod.store.tasks_for(meeting_id), "ar")[0], 2, "ar")
+    assert "📞 ❓ فهد العتيبي (مطور) / فهد الشمري (مالية)" in card
+
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", 1)
+    preview = max(bot.messages)
+    text, markup = bot.messages[preview]
+    assert "👤 فهد الشمري (مالية) — تيليجرام\n  • 2. إعداد الفاتورة" in text
+    assert "1. فهد — ❓ أكثر من شخص بهذا الاسم: فهد العتيبي (مطور) / فهد الشمري (مالية)" in text
+    choices = _buttons(markup)[:2]
+    assert choices == [[("1 ← فهد العتيبي (مطور)", f"rec:w:a:{meeting_id}:1:1")],
+                       [("1 ← فهد الشمري (مالية)", f"rec:w:a:{meeting_id}:1:2")]]
+    assert _press(mod, gw.adapter, f"rec:w:a:{meeting_id}:1:1", preview, user="99") == ["Not allowed."]
+    _press(mod, gw.adapter, f"rec:w:a:{meeting_id}:1:1", preview)
+    assert "👤 فهد العتيبي (مطور) — تيليجرام\n  • 1. مراجعة الكود" in bot.messages[preview][0]
+    assert mod.store.tasks_for(meeting_id)[0]["contact_id"] == "1"
+
+    # Approving a join onto a short name registered to someone else asks for another name.
+    token = _invite(mod, gw)
+    _join(mod, gw.adapter, token, user=803, name="Fahad Q")
+    request = max(bot.messages)
+    _press(mod, gw.adapter, "rec:j:o:1", request)
+    gw.adapter.sent.clear()
+    assert _dispatch(mod, gw, _event(text="فهد", message_type="TEXT")) is None
+    assert gw.adapter.sent == ["«فهد» مسجّل بالفعل لـ فهد العتيبي (مطور). اكتب اسماً مختصراً آخر لهذا الشخص "
+                               "(مثلاً الاسم الأول وحرف من العائلة)."]
+    assert mod.contacts.exact("فهد")["telegram_chat_id"] == "801"  # untouched
+    assert _dispatch(mod, gw, _event(text="فهد ق", message_type="TEXT")) is None
+    assert mod.contacts.exact("فهد ق")["telegram_chat_id"] == "803"
+
+
+def test_team_lists_registered_members_and_contacts_can_be_edited_or_deleted(recorder, telegram_stub):
+    from hermes_cli.commands_platforms import telegram_menu_commands
+    mod = recorder
+    assert "team" in dict(telegram_menu_commands()[0])
+    assert mod._cmd_team("") == "لا يوجد أحد مسجل بعد — استخدم /invite"
+    _two_fahads(mod)
+    mod.contacts.save_contact("فهد", "fahad@tact.sa")
+    mod.contacts.save_contact("نورة", "noura@tact.sa")  # in the book, never registered in the bot
+    mod.contacts.save_contact("خالد", "@khalid_k")       # a username only: not registered either
+    today = mod.store.now().isoformat()[:10]
+    assert mod._cmd_team("") == (
+        "👥 الفريق (2)\n\n"
+        f"👤 فهد الشمري\n💼 مالية\n📅 انضم: {today}\n\n"
+        f"👤 فهد العتيبي\n💼 مطور\n🔗 @fahad_dev\n📧 fahad@tact.sa\n📅 انضم: {today}")
+
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    assert _dispatch(mod, gw, _event(text="/contacts edit نورة", message_type="TEXT")) is None
+    edit = max(bot.messages)
+    assert bot.messages[edit][0].startswith("✏️ نورة\nالاسم المختصر: نورة\nالاسم الكامل: —")
+    noura = mod.contacts.exact("نورة")["id"]
+    assert _buttons(bot.messages[edit][1]) == [[("👤 الاسم الكامل", f"rec:p:f:{noura}"), ("💼 الوظيفة", f"rec:p:r:{noura}")],
+                                               [("📞 التواصل", f"rec:p:k:{noura}")]]
+    assert _press(mod, gw.adapter, f"rec:p:r:{noura}", edit, user="99") == ["Not allowed."]
+    _press(mod, gw.adapter, f"rec:p:r:{noura}", edit)
+    assert gw.adapter.sent[-1] == "أرسل الوظيفة / القسم لـ نورة"
+    assert _dispatch(mod, gw, _event(text="تصميم", message_type="TEXT")) is None
+    assert mod.contacts.exact("نورة")["role"] == "تصميم" and mod.contacts.label_for("نورة") == "نورة (تصميم)"
+    _press(mod, gw.adapter, f"rec:p:k:{noura}", edit)
+    assert _dispatch(mod, gw, _event(text="not a contact", message_type="TEXT")) is None
+    assert gw.adapter.sent[-1].startswith("📞 هذه ليست وسيلة تواصل")
+    # A first name that fits two people asks which one (an exact short name is one person).
+    mod.contacts.save_contact("سعد أ", "saad.a@tact.sa")
+    mod.contacts.save_contact("سعد ب", "saad.b@tact.sa")
+    assert _dispatch(mod, gw, _event(text="/contacts edit سعد", message_type="TEXT")) is None
+    assert [b for row in _buttons(bot.messages[max(bot.messages)][1]) for b, _ in row] == ["سعد أ", "سعد ب"]
+    assert _dispatch(mod, gw, _event(text="/contacts edit فهد", message_type="TEXT")) is None
+    assert bot.messages[max(bot.messages)][0].startswith("✏️ فهد العتيبي (مطور)\nالاسم المختصر: فهد\n")
+
+    # Deleting a registered member asks first; afterwards they are gone from /team and get no tasks.
+    assert _dispatch(mod, gw, _event(text="/contacts delete فهد الشمري", message_type="TEXT")) is None
+    question = max(bot.messages)
+    assert bot.messages[question][0] == ("🗑️ حذف فهد الشمري (مالية) من جهات الاتصال؟ هو مسجّل في البوت وسيتوقف "
+                                         "عن استقبال المهام.")
+    assert "فهد الشمري" in mod._cmd_team("")  # not before ✅
+    _press(mod, gw.adapter, "rec:p:d:2", question)
+    assert "فهد الشمري" not in mod._cmd_team("") and mod._cmd_team("").startswith("👥 الفريق (1)")
+    assert mod.contacts.route("فهد ش", "", False).reason == "unknown"

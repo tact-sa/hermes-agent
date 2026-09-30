@@ -61,7 +61,8 @@ def connect() -> sqlite3.Connection:
     # (feeds "/brief <id> retry") and the Telegram message ids of each task card and of the
     # "Confirm all" message (edited in place when a task changes).
     for table, column in (("meetings", "note"), ("meetings", "confirm_message_id"), ("meetings", "manager_name"),
-                          ("tasks", "message_id"), ("tasks", "contact"), ("tasks", "sent_via")):
+                          ("tasks", "message_id"), ("tasks", "contact"), ("tasks", "sent_via"),
+                          ("tasks", "contact_id")):
         if column not in {row[1] for row in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
     return con
@@ -196,6 +197,13 @@ def set_task_contact(meeting_id: int, position: int, contact: str) -> None:
     with connect() as con:
         con.execute("UPDATE tasks SET contact = ? WHERE meeting_id = ? AND position = ?",
                     (contact, meeting_id, position))
+
+
+def set_task_contact_id(meeting_id: int, position: int, contact_id: int) -> None:
+    """The manager's choice of which contact a shared first name means for this task."""
+    with connect() as con:
+        con.execute("UPDATE tasks SET contact_id = ? WHERE meeting_id = ? AND position = ?",
+                    (str(contact_id), meeting_id, position))
 
 
 def mark_sent(meeting_id: int, position: int, channels: List[str]) -> None:

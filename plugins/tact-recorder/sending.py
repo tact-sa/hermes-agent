@@ -35,6 +35,7 @@ TEXT = {
            "unclear": "المسؤول غير واضح", "unknown": "وسيلة التواصل غير معروفة",
            "not_registered": "⏳ لم يسجّل في البوت بعد — أرسل له رابط /invite",
            "email_off": "إرسال البريد غير مُعدّ", "phone": "لا يمكن مراسلة أرقام الهواتف بعد",
+           "ambiguous": "❓ أكثر من شخص بهذا الاسم: {choices} — اختر من الأزرار",
            "preview": "📤 معاينة الإرسال — اجتماع {id}", "skipped": "⏭️ لن تُرسل:",
            "resend": "⚠️ {n} من هذه المهام أُرسلت من قبل وسيُعاد إرسالها إذا ضغطت ✅.",
            "nothing": "لا توجد مهام يمكن إرسالها الآن.",
@@ -49,6 +50,7 @@ TEXT = {
            "unclear": "owner unclear", "unknown": "contact unknown",
            "not_registered": "⏳ not registered in the bot yet — send them an /invite link",
            "email_off": "email sending not configured", "phone": "phone numbers can't be messaged yet",
+           "ambiguous": "❓ more than one person with this name: {choices} — choose with the buttons",
            "preview": "📤 Sending preview — Meeting {id}", "skipped": "⏭️ Will not be sent:",
            "resend": "⚠️ {n} of these tasks were sent before and will be sent again if you tap ✅.",
            "nothing": "There are no tasks that can be sent now.",
@@ -77,6 +79,7 @@ def plan(meeting_id: int) -> Dict[str, Any]:
     ready = email_ready()
     recipients: Dict[Tuple[str, str], Dict[str, Any]] = {}
     skipped: List[Tuple[Dict[str, Any], str, str]] = []
+    choices: List[Tuple[Dict[str, Any], tuple]] = []
     tasks = [t for t in store.tasks_for(meeting_id) if t["status"] == "confirmed"]
     for task in tasks:
         names = fmt.split_owners(task["person"])
@@ -85,15 +88,28 @@ def plan(meeting_id: int) -> Dict[str, Any]:
             continue
         for name in names:
             # The task's own contact belongs to its single owner; joint owners use the book.
-            route = contacts.route(name, task["contact"] if len(names) == 1 else "", ready)
+            single = len(names) == 1
+            route = contacts.route(name, task["contact"] if single else "", ready,
+                                   task.get("contact_id") if single else None)
             if not route.channel:
-                skipped.append((task, name, route.reason))
+                skipped.append((task, route.who or name, route.reason))
+                if route.choices:  # a shared first name: the manager picks, nothing is guessed
+                    choices.append((task, route.choices))
                 continue
             entry = recipients.setdefault((route.channel, route.target),
-                                          {"name": name, "channel": route.channel, "target": route.target, "tasks": []})
+                                          {"name": route.who or name, "channel": route.channel,
+                                           "target": route.target, "tasks": []})
             entry["tasks"].append(task)
     already = sum(1 for t in tasks if t["sent_at"] and any(t in r["tasks"] for r in recipients.values()))
-    return {"recipients": list(recipients.values()), "skipped": skipped, "already_sent": already}
+    return {"recipients": list(recipients.values()), "skipped": skipped, "already_sent": already,
+            "choices": choices}
+
+
+def _reason(text: Dict[str, str], p: Dict[str, Any], task: Dict[str, Any], reason: str) -> str:
+    if reason != "ambiguous":
+        return text[reason]
+    rows = next((rows for t, rows in p.get("choices", []) if t["position"] == task["position"]), ())
+    return text["ambiguous"].format(choices=" / ".join(contacts.label(r) for r in rows))
 
 
 def preview_text(meeting_id: int, lang: str, p: Dict[str, Any]) -> str:
@@ -105,8 +121,8 @@ def preview_text(meeting_id: int, lang: str, p: Dict[str, Any]) -> str:
         lines += [f"  • {t['position']}. {t['task']}" for t in r["tasks"]]
     if p["skipped"]:
         lines.append(f"\n{text['skipped']}")
-        lines += [f"  • {t['position']}. {name or fmt.owner_text(t, lang, question=False)} — {text[reason]}"
-                  for t, name, reason in p["skipped"]]
+        lines += [f"  • {t['position']}. {name or fmt.owner_text(t, lang, question=False)} — "
+                  f"{_reason(text, p, t, reason)}" for t, name, reason in p["skipped"]]
         lines.append(text["fix_hint"])
     if not p["recipients"]:
         lines.append(f"\n{text['nothing']}")
@@ -164,21 +180,27 @@ async def execute(bot: Any, meeting: Any, lang: str, p: Dict[str, Any]) -> Tuple
         store.mark_sent(meeting["id"], position, previous + via)
     if p["skipped"]:
         report.append(text["skipped"])
-        report += [f"  • {t['position']}. {name or fmt.owner_text(t, lang, question=False)} — {text[reason]}"
-                   for t, name, reason in p["skipped"]]
+        report += [f"  • {t['position']}. {name or fmt.owner_text(t, lang, question=False)} — "
+                   f"{_reason(text, p, t, reason)}" for t, name, reason in p["skipped"]]
     logger.info("tact-recorder: meeting #%s: %d of %d recipient(s) sent, %d task(s) skipped",
                 meeting["id"], sent, len(p["recipients"]), len(p["skipped"]))
     return "\n".join(report), sorted(channels)
 
 
-def markup(kind: str, meeting_id: int, lang: str) -> Any:
-    """[📤 Send tasks] ("ask") or [✅ Send] [❌ Cancel] ("confirm")."""
+def markup(kind: str, meeting_id: int, lang: str, p: Optional[Dict[str, Any]] = None) -> Any:
+    """[📤 Send tasks] ("ask"), or the preview's buttons ("confirm"): one per possible person for a
+    name that fits several, then [✅ Send] [❌ Cancel] when anyone can be sent to."""
     from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
     text = TEXT[lang]
     if kind == "ask":
         return InlineKeyboardMarkup([[Button(text["btn"], callback_data=f"rec:x:p:{meeting_id}")]])
-    return InlineKeyboardMarkup([[Button(text["btn_send"], callback_data=f"rec:x:s:{meeting_id}"),
-                                  Button(text["btn_cancel"], callback_data=f"rec:x:c:{meeting_id}")]])
+    rows = [[Button(f"{task['position']} ← {contacts.label(row)}",
+                    callback_data=f"rec:w:a:{meeting_id}:{task['position']}:{row['id']}")]
+            for task, candidates in (p or {}).get("choices", []) for row in candidates]
+    if not p or p["recipients"]:
+        rows.append([Button(text["btn_send"], callback_data=f"rec:x:s:{meeting_id}"),
+                     Button(text["btn_cancel"], callback_data=f"rec:x:c:{meeting_id}")])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def has_sendable(meeting_id: int) -> bool:

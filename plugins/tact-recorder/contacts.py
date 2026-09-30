@@ -1,8 +1,12 @@
 """The contacts book: how to reach each person tasks are assigned to.
 
-One row per person (name + other spellings) with any of: a Telegram chat id (only ever set when the
-manager approves an invite join, see ``invite.py``), a Telegram @username, an email, a phone. Names
-match the way owners do (``brief.name_key``: Arabic/English variants, case, diacritics).
+One row per person: a short name (unique; what meetings usually say), other spellings, an optional
+full name and role (shown as "full name (role)" wherever the manager picks or reads a person), and
+any of: a Telegram chat id (only ever set when the manager approves an invite join, see
+``invite.py``), a Telegram @username, an email, a phone. Names match the way owners do
+(``brief.name_key``) against the short name, the spellings, the full name and first names; when a
+name fits more than one person, nothing is guessed: ``matches`` returns them all and the manager
+picks (the choice is kept on the task as ``contact_id``).
 
 ``route`` decides how a task reaches one owner: the task's own contact (said in the meeting or set
 by the manager) first, else the book. Telegram needs a chat id: a bot cannot message someone who
@@ -27,7 +31,10 @@ def _connect():
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, aliases TEXT NOT NULL DEFAULT '[]',"
         " telegram_chat_id TEXT, telegram_username TEXT, email TEXT, phone TEXT,"
-        " updated_at TEXT NOT NULL)")
+        " updated_at TEXT NOT NULL, full_name TEXT, role TEXT, joined_at TEXT)")
+    for column in ("full_name", "role", "joined_at"):  # added after the first release
+        if column not in {row[1] for row in con.execute("PRAGMA table_info(contacts)")}:
+            con.execute(f"ALTER TABLE contacts ADD COLUMN {column} TEXT")
     # Names the manager removed (/contacts delete) that live on in past tasks: kept out of pickers.
     con.execute("CREATE TABLE IF NOT EXISTS hidden_names (name_key TEXT PRIMARY KEY)")
     return con
@@ -78,15 +85,51 @@ def all_contacts() -> List[Dict[str, Any]]:
     return [{**dict(r), "aliases": json.loads(r["aliases"] or "[]")} for r in rows]
 
 
-def find(name: str) -> Optional[Dict[str, Any]]:
-    """The person's row by name or any saved spelling."""
+def label(row: Dict[str, Any]) -> str:
+    """How the manager sees a person: "full name (role)", falling back to the short name."""
+    who = row.get("full_name") or row["name"]
+    return f"{who} ({row['role']})" if row.get("role") else who
+
+
+def label_for(name: str) -> str:
+    row = find(name)
+    return label(row) if row else name
+
+
+def by_id(contact_id: Any) -> Optional[Dict[str, Any]]:
+    return next((r for r in all_contacts() if str(r["id"]) == str(contact_id)), None)
+
+
+def exact(name: str) -> Optional[Dict[str, Any]]:
+    """The row whose short name, spelling or full name is exactly *name* (for writes)."""
     key = fmt.name_key(name)
-    if not key:
-        return None
-    for row in all_contacts():
-        if key == row["name_key"] or key in {fmt.name_key(a) for a in row["aliases"]}:
+    for row in all_contacts() if key else []:
+        if key in {row["name_key"], fmt.name_key(row["full_name"] or "")} | {fmt.name_key(a) for a in row["aliases"]}:
             return row
     return None
+
+
+def matches(name: str) -> List[Dict[str, Any]]:
+    """Every person *name* may mean: an exact full name is one person; otherwise the short name,
+    spellings and first names all count, so a shared first name gives several rows."""
+    key = fmt.name_key(name)
+    if not key:
+        return []
+    rows = all_contacts()
+    full = [r for r in rows if r["full_name"] and fmt.name_key(r["full_name"]) == key]
+    if len(full) == 1:
+        return full
+
+    def first(text: str) -> str:
+        return fmt.name_key(text).split(" ")[0] if text else ""
+    return [r for r in rows if key == r["name_key"] or key in {fmt.name_key(a) for a in r["aliases"]}
+            or (" " not in key and key in {first(r["name"]), first(r["full_name"] or "")})]
+
+
+def find(name: str) -> Optional[Dict[str, Any]]:
+    """The one person *name* means, or None when it is nobody or more than one person."""
+    found = matches(name)
+    return found[0] if len(found) == 1 else None
 
 
 def by_username(username: str) -> Optional[Dict[str, Any]]:
@@ -101,7 +144,7 @@ def by_chat_id(chat_id: str) -> Optional[Dict[str, Any]]:
 def _upsert(name: str, **fields: Any) -> None:
     fields["updated_at"] = store.now().isoformat(timespec="seconds")
     _set_hidden(name, False)  # a person the manager gives a contact to is back in the pickers
-    row = find(name)
+    row = exact(name)
     with _connect() as con:
         if row is None:
             fields.update(name=fmt.clean(name), name_key=fmt.name_key(name))
@@ -126,10 +169,26 @@ def link_telegram(name: str, chat_id: str, username: str = "") -> None:
     """The manager approved this Telegram chat for *name*; a chat belongs to one person only."""
     with _connect() as con:
         con.execute("UPDATE contacts SET telegram_chat_id = NULL WHERE telegram_chat_id = ?", (str(chat_id),))
+    row = exact(name)
     fields: Dict[str, Any] = {"telegram_chat_id": str(chat_id)}
     if username:
         fields["telegram_username"] = "@" + username.lstrip("@")
+    if row is None or not row["joined_at"] or row["telegram_chat_id"] != str(chat_id):
+        fields["joined_at"] = store.now().isoformat(timespec="seconds")
     _upsert(name, **fields)
+
+
+def registered_elsewhere(name: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    """The contact already registered under exactly this name for ANOTHER Telegram chat."""
+    row = exact(name)
+    return row if row and row["telegram_chat_id"] and row["telegram_chat_id"] != str(chat_id) else None
+
+
+def set_details(name: str, **fields: str) -> None:
+    """Full name / role for an existing person (empty values are ignored)."""
+    fields = {k: fmt.clean(v) for k, v in fields.items() if k in ("full_name", "role") and fmt.clean(v)}
+    if fields:
+        _upsert(name, **fields)
 
 
 def _in_past_tasks(name: str) -> bool:
@@ -142,7 +201,7 @@ def _in_past_tasks(name: str) -> bool:
 def delete(name: str) -> bool:
     """Remove *name* from the book and from every name picker (past tasks keep their text);
     False when the name is neither in the book nor in any task."""
-    row = find(name)
+    row = exact(name)
     known = row is not None or _in_past_tasks(name)
     if row is not None:
         with _connect() as con:
@@ -157,7 +216,7 @@ def rename(old: str, new: str) -> Tuple[bool, str]:
     old, new = fmt.clean(old), fmt.clean(new)
     if not is_person_name(new):
         return False, f"«{new}» ليس اسماً صالحاً."
-    row, target = find(old), find(new)
+    row, target = exact(old), exact(new)
     if row is not None and target is not None and target["id"] != row["id"]:
         return False, f"{new} موجود بالفعل في جهات الاتصال."
     tasks = store.rename_person(fmt.name_key(old), new, fmt.name_key, fmt.split_owners)
@@ -175,7 +234,7 @@ def rename(old: str, new: str) -> Tuple[bool, str]:
 def has_value(name: str, contact: str) -> bool:
     """Whether the book already holds exactly this contact for *name* (no need to ask again)."""
     kind, value = fmt.classify_contact(contact)
-    row = find(name)
+    row = exact(name)
     column = {"email": "email", "username": "telegram_username", "phone": "phone"}.get(kind)
     return bool(row and column and (row[column] or "").casefold() == value.casefold())
 
@@ -185,10 +244,12 @@ def has_value(name: str, contact: str) -> bool:
 class Route(NamedTuple):
     channel: str  # "telegram" / "email", or "" when the task can't be sent to this person
     target: str  # chat id / email address
-    reason: str  # why not: unknown / not_registered / email_off / phone
+    reason: str  # why not: unknown / not_registered / email_off / phone / ambiguous
+    who: str = ""  # the person's label, when known
+    choices: tuple = ()  # the contacts an ambiguous name may mean
 
 
-def route(name: str, explicit: str, email_ready: bool) -> Route:
+def route(name: str, explicit: str, email_ready: bool, contact_id: Any = None) -> Route:
     kind, value = fmt.classify_contact(explicit)
     row = None
     if kind == "username":
@@ -199,16 +260,20 @@ def route(name: str, explicit: str, email_ready: bool) -> Route:
         return Route("email", value, "") if email_ready else Route("", "", "email_off")
     if kind == "phone":
         return Route("", "", "phone")
-    row = find(name)
+    found = [by_id(contact_id)] if contact_id and by_id(contact_id) else matches(name)
+    if len(found) > 1:
+        return Route("", "", "ambiguous", choices=tuple(found))
+    row = found[0] if found else None
+    who = label(row) if row else ""
     if row and row["telegram_chat_id"]:
-        return Route("telegram", row["telegram_chat_id"], "")
+        return Route("telegram", row["telegram_chat_id"], "", who)
     if row and row["email"]:
-        return Route("email", row["email"], "") if email_ready else Route("", "", "email_off")
+        return Route("email", row["email"], "", who) if email_ready else Route("", "", "email_off", who)
     if row and row["telegram_username"]:
-        return Route("", "", "not_registered")
+        return Route("", "", "not_registered", who)
     if row and row["phone"]:
-        return Route("", "", "phone")
-    return Route("", "", "unknown")
+        return Route("", "", "phone", who)
+    return Route("", "", "unknown", who)
 
 
 def row_text(row: Dict[str, Any], lang: str) -> str:
@@ -233,10 +298,14 @@ def display(task: Dict[str, Any], lang: str) -> str:
     if kind:
         return value
     names = fmt.split_owners(task["person"])
+    chosen = by_id(task["contact_id"]) if len(names) == 1 and task.get("contact_id") else None
     parts = []
     for name in names:
-        row = find(name)
-        text = row_text(row, lang) if row else ""
+        found = [chosen] if chosen else matches(name)
+        if len(found) > 1:  # shared first name: the manager chooses in the send preview
+            text = "❓ " + " / ".join(label(r) for r in found)
+        else:
+            text = row_text(found[0], lang) if found else ""
         if text:
             parts.append(f"{name}: {text}" if len(names) > 1 else text)
     return "، ".join(parts) or labels["unknown"]
@@ -255,6 +324,38 @@ def list_text() -> str:
         return "👥 لا توجد جهات اتصال بعد. أرسل /invite لدعوة شخص عبر تيليجرام."
     lines = [f"👥 جهات الاتصال ({len(rows)}):"]
     for row in rows:
-        lines.append(f"• {row['name']} — {row_text(row, 'ar') or 'غير معروف'}")
-    lines.append("لحذف جهة: /contacts delete <الاسم> · لتصحيح اسم: /contacts rename <القديم> -> <الجديد>")
+        lines.append(f"• {label(row)} — {row_text(row, 'ar') or 'غير معروف'}")
+    lines.append("تعديل: /contacts edit <الاسم> · حذف: /contacts delete <الاسم> · "
+                 "تصحيح اسم: /contacts rename <القديم> -> <الجديد>")
     return "\n".join(lines)
+
+
+def team_text() -> str:
+    """/team: only people the manager approved and who registered in the bot."""
+    rows = sorted((r for r in all_contacts() if r["telegram_chat_id"]),
+                  key=lambda r: fmt.name_key(r["full_name"] or r["name"]))
+    if not rows:
+        return "لا يوجد أحد مسجل بعد — استخدم /invite"
+    blocks = []
+    for row in rows:
+        lines = [f"👤 {row['full_name'] or row['name']}"]
+        if row["role"]:
+            lines.append(f"💼 {row['role']}")
+        if row["telegram_username"]:
+            lines.append(f"🔗 {row['telegram_username']}")
+        reach = " · ".join(v for v in (f"📧 {row['email']}" if row["email"] else "",
+                                       f"📞 {row['phone']}" if row["phone"] else "") if v)
+        if reach:
+            lines.append(reach)
+        lines.append(f"📅 انضم: {(row['joined_at'] or row['updated_at'])[:10]}")
+        blocks.append("\n".join(lines))
+    return f"👥 الفريق ({len(rows)})\n\n" + "\n\n".join(blocks)
+
+
+def edit_text(row: Dict[str, Any]) -> str:
+    return (f"✏️ {label(row)}\n"
+            f"الاسم المختصر: {row['name']}\n"
+            f"الاسم الكامل: {row['full_name'] or '—'}\n"
+            f"الوظيفة / القسم: {row['role'] or '—'}\n"
+            f"التواصل: {row_text(row, 'ar') or 'غير معروف'}\n"
+            "اختر ما تريد تعديله:")
