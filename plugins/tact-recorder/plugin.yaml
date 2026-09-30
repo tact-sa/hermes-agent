@@ -1,6 +1,6 @@
 name: tact-recorder
 version: "0.1.0"
-description: "Meeting recorder: the manager sends a meeting recording (audio file, audio document or long voice note) in a private chat; it is transcribed with the configured STT provider, summarised into a brief (summary, decisions, open issues) and a task list per person, and the tasks go back to the manager ONLY for confirmation (buttons on Telegram, or text replies). /recordings lists recent meetings, /brief <id> re-shows one."
+description: "Meeting recorder: the manager sends a meeting recording (audio file, audio document or long voice note) in a private chat; it is transcribed with the configured STT provider, summarised into a brief (summary, decisions, open issues) and a task list per person, and the tasks go back to the manager ONLY for confirmation (buttons on Telegram, or text replies). /recordings lists recent meetings, /brief <id> re-shows one. After confirmation, and only on the manager's explicit approval of a preview, each person can be sent their own tasks by Telegram (members join via a manager-approved /invite link) or email (SMTP); /contacts lists who can receive tasks."
 author: "Tact"
 provides_hooks:
   - pre_gateway_dispatch

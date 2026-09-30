@@ -8,6 +8,7 @@ store, the file handling and (when installed) ffmpeg's chunking are the real one
 
 import asyncio
 import json
+import re
 import logging
 import wave
 from pathlib import Path
@@ -54,12 +55,16 @@ class FakeBot:
     """Telegram bot stand-in: every message it sends or edits, by message id."""
 
     def __init__(self):
-        self.messages, self.edits, self._next = {}, [], 100
+        self.messages, self.edits, self.to, self._next = {}, [], {}, 100
 
     async def send_message(self, chat_id, text, reply_markup=None):
         self._next += 1
         self.messages[self._next] = (text, reply_markup)
+        self.to[self._next] = str(chat_id)
         return SimpleNamespace(message_id=self._next)
+
+    def sent_to(self, chat_id):
+        return [self.messages[i][0] for i, c in self.to.items() if c == str(chat_id)]
 
     async def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         assert message_id in self.messages, "only our own messages are edited"
@@ -78,7 +83,16 @@ def telegram_stub(monkeypatch):
     tg = SimpleNamespace(
         InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data),
         InlineKeyboardMarkup=lambda rows: SimpleNamespace(inline_keyboard=rows))
-    ext = SimpleNamespace(CallbackQueryHandler=lambda callback, pattern: SimpleNamespace(callback=callback, pattern=pattern))
+    class Filter:
+        def __init__(self, *parts):
+            self.parts = parts
+
+        def __and__(self, other):
+            return Filter(self, other)
+    ext = SimpleNamespace(
+        CallbackQueryHandler=lambda callback, pattern: SimpleNamespace(callback=callback, pattern=pattern),
+        MessageHandler=lambda flt, callback: SimpleNamespace(callback=callback, filters=flt),
+        filters=SimpleNamespace(Regex=lambda pattern: Filter(pattern), ChatType=SimpleNamespace(PRIVATE=Filter())))
     monkeypatch.setitem(sys.modules, "telegram", tg)
     monkeypatch.setitem(sys.modules, "telegram.ext", ext)
 
@@ -203,9 +217,9 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
         assert header in brief
     assert brief.endswith("\n\n📋 Tasks (3) in the following messages") and "Send the Q3 budget" not in brief
     (card1, m1), (card2, m2), (card3, _), (all_text, all_markup) = gw.adapter._bot.messages.values()
-    assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday"
+    assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 unknown"
     assert _buttons(m1) == [[("✅ Confirm", "rec:c:1:1"), ("✏️ Edit", "rec:e:1:1"), ("❌ Cancel", "rec:r:1:1")]]
-    assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED"
+    assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED\n📞 unknown"
     assert card3.startswith("📋 Task 3 of 3\n👤 Ahmad")
     assert _buttons(all_markup) == [[("✅ Confirm all (3)", "rec:a:1:0")]] and "confirm 2" in all_text
     assert not any("[#" in text for text, _ in gw.adapter._bot.messages.values())
@@ -275,12 +289,14 @@ def test_unclear_owner_is_flagged_and_spellings_merge_into_one_person(recorder):
         rows = [dict(t, position=i, status="confirmed") for i, t in enumerate(tasks, 1)]
         assert f"👤 {unclear}\n📌 Call the vendor\n📅 {missing}" in fmt.task_card(rows[1], 3, language)
         # The final summary: one labelled block per task under its own number; no brackets.
-        title, name, task, due = (("✅ Confirmed tasks — Meeting 1", "Name", "Task", "Deadline") if lang == "en"
-                                  else ("✅ المهام المؤكدة — اجتماع 1", "الاسم", "المهمة", "الموعد"))
+        title, name, task, due, how, unknown = (
+            ("✅ Confirmed tasks — Meeting 1", "Name", "Task", "Deadline", "Contact", "unknown") if lang == "en"
+            else ("✅ المهام المؤكدة — اجتماع 1", "الاسم", "المهمة", "الموعد", "التواصل", "غير معروف"))
         assert fmt.final_text(1, language, rows) == (
-            f"{title}\n\n1.\n👤 {name}: {owner}\n📌 {task}: Send the Q3 budget\n📅 {due}: Sunday"
+            f"{title}\n\n1.\n👤 {name}: {owner}\n📌 {task}: Send the Q3 budget\n📅 {due}: Sunday\n📞 {how}: {unknown}"
             f"\n\n2.\n👤 {name}: {unclear.rstrip('?؟')}\n📌 {task}: Call the vendor\n📅 {due}: {missing}"
-            f"\n\n3.\n👤 {name}: {owner}\n📌 {task}: Book the launch venue\n📅 {due}: {missing}")
+            f"\n📞 {how}: {unknown}"
+            f"\n\n3.\n👤 {name}: {owner}\n📌 {task}: Book the launch venue\n📅 {due}: {missing}\n📞 {how}: {unknown}")
     assert fmt.brief_text(1, "2026-09-30T10:00:00", "ar", brief, 3).endswith("📋 المهام (3) في الرسائل التالية")
 
 
@@ -317,10 +333,10 @@ def test_text_replies_edit_labelled_fields_and_cancel(recorder, monkeypatch):
     assert cancelled == "❌ Task 2 cancelled."
     assert final == (
         f"✅ Confirmed tasks — Meeting {meeting_id}\n\n"
-        "1.\n👤 Name: Ahmad\n📌 Task: إرسال الميزانية\n📅 Deadline: يوم الخميس\n\n"
+        "1.\n👤 Name: Ahmad\n📌 Task: إرسال الميزانية\n📅 Deadline: يوم الخميس\n📞 Contact: unknown\n\n"
         "❌ Cancelled tasks\n\n"
-        "2.\n👤 Name: Omar\n📌 Task: Call the vendor\n📅 Deadline: Thursday\n\n"
-        "3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue\n📅 Deadline: NOT MENTIONED")
+        "2.\n👤 Name: Omar\n📌 Task: Call the vendor\n📅 Deadline: Thursday\n📞 Contact: unknown\n\n"
+        "3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue\n📅 Deadline: NOT MENTIONED\n📞 Contact: unknown")
     assert [t["status"] for t in store.tasks_for(meeting_id)] == ["confirmed", "removed", "removed"]
     assert store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
     # Nothing pending any more: confirmation words are ordinary messages again.
@@ -385,8 +401,9 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
 
     normal = [[("✅ Confirm", f"rec:c:{meeting_id}:2"), ("✏️ Edit", f"rec:e:{meeting_id}:2"),
                ("❌ Cancel", f"rec:r:{meeting_id}:2")]]
-    picker = [[("👤 Name", f"rec:f:{meeting_id}:2:n"), ("📌 Task", f"rec:f:{meeting_id}:2:t"),
-               ("📅 Deadline", f"rec:f:{meeting_id}:2:d")], [("↩️ Back", f"rec:b:{meeting_id}:2")]]
+    picker = [[("👤 Name", f"rec:f:{meeting_id}:2:n"), ("📌 Task", f"rec:f:{meeting_id}:2:t")],
+              [("📅 Deadline", f"rec:f:{meeting_id}:2:d"), ("📞 Contact", f"rec:f:{meeting_id}:2:k")],
+              [("↩️ Back", f"rec:b:{meeting_id}:2")]]
 
     gw.adapter.sent.clear()
     press(f"rec:e:{meeting_id}:2", card2)  # ✏️: the card itself offers the fields
@@ -407,7 +424,7 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
             {k: before[k] for k in ("person", "task", "deadline") if k != field}
         assert _buttons(bot.messages[card2][1]) == normal
     assert bot.messages[card2][0] == ("📋 Task 2 of 3\n👤 عمر (يحدد لاحقا)\n📌 الاسم: احمد او عمر (يحدد لاحقا)"
-                                      "\n📅 يوم الخميس")
+                                      "\n📅 يوم الخميس\n📞 unknown")
     assert task(2)["candidates"] == []  # the unclear task now belongs to that person
     # ↩️ puts the normal buttons back and nothing is waiting for a value.
     press(f"rec:e:{meeting_id}:2", card2)
@@ -418,7 +435,8 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
 
     assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."]
     press(f"rec:c:{meeting_id}:1", card1)
-    assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n\n✅ Confirmed", None)
+    assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 unknown"
+                                   "\n\n✅ Confirmed", None)
     reply("إلغاء 3")  # a text reply edits that task's card, like its button would
     assert bot.messages[card3][0].endswith("\n\n❌ Cancelled") and bot.messages[card3][1] is None
     assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (1)", f"rec:a:{meeting_id}:0")]]
@@ -432,8 +450,8 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
     assert "\n\n❌ Cancelled tasks\n\n3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue" in final
     # Arabic meetings get Arabic buttons, with "إلغاء" for cancel.
     ar_picker = mod.present._picker_markup(meeting_id, 2, "ar")
-    assert [b for b, _ in _buttons(ar_picker)[0]] + [b for b, _ in _buttons(ar_picker)[1]] == [
-        "👤 الاسم", "📌 المهمة", "📅 الموعد", "↩️ رجوع"]
+    assert [b for row in _buttons(ar_picker) for b, _ in row] == [
+        "👤 الاسم", "📌 المهمة", "📅 الموعد", "📞 التواصل", "↩️ رجوع"]
     assert [b for b, _ in _buttons(mod.present._card_markup(meeting_id, dict(task(1), status="pending"), "ar"))[0]] == [
         "✅ تأكيد", "✏️ تعديل", "❌ إلغاء"]
 
@@ -520,7 +538,7 @@ def test_brief_json_is_recovered_from_code_fences_and_prose(recorder, monkeypatc
     language, brief, tasks = asyncio.run(fmt.analyze(llm, AR_TRANSCRIPT))
     card = fmt.task_card(dict(tasks[0], position=1, status="pending"), 1, language)
     assert language == "ar" and brief["decisions"] == [] and brief["open_issues"] == []
-    assert card == "📋 مهمة 1 من 1\n👤 ❓ غير واضح\n📌 إرسال الميزانية\n📅 غير مذكور"
+    assert card == "📋 مهمة 1 من 1\n👤 ❓ غير واضح\n📌 إرسال الميزانية\n📅 غير مذكور\n📞 غير معروف"
 
 
 async def _result(llm, kw, text):
@@ -637,7 +655,7 @@ def test_tasks_accept_other_keys_and_deadlines_glued_to_the_task(recorder):
         ("Omar", "Send the deck", "Tuesday", []),
         ("أحمد", "مراجعة العقد", "يوم الأحد القادم", []),
         ("سارة", "تجهيز العرض التقديمي لشركة النخبة وترتيب اجتماع معهم", "قبل نهاية الأسبوع القادم", []),
-        ("", "إرسال التقرير", "بكرة", ["أحمد", "عمر"]),  # two owners named: unclear, not guessed
+        ("أحمد، عمر", "إرسال التقرير", "بكرة", []),  # two owners named: joint owners (sent to both)
         ("", "مراجعة خطة الأسبوع", "", [])]
 
 
@@ -739,3 +757,270 @@ def test_a_failing_brief_model_falls_back_to_the_main_model(recorder, caplog):
     assert brief["decisions"] == ["d"] and tasks[0]["deadline"] == "بكرة"
     assert f"brief model {GEMINI} failed (RuntimeError); falling back to the main chat model" in caplog.text
     assert "التقرير" not in caplog.text
+
+
+# -- contacts, invites and sending ------------------------------------------------------------------
+
+def _press(mod, adapter, data, message_id, user=MANAGER):
+    """A button press through the plugin's real Telegram callback handler."""
+    handlers = []
+    mod._telegram_handlers(SimpleNamespace(add_handler=handlers.append), adapter)
+    toasts = []
+
+    async def answer(text=None):
+        toasts.append(text)
+    query = SimpleNamespace(data=data, from_user=SimpleNamespace(id=int(user)), answer=answer,
+                            message=SimpleNamespace(chat=SimpleNamespace(id=int(CHAT)), message_id=message_id))
+    asyncio.run(handlers[0].callback(SimpleNamespace(callback_query=query), None))
+    return toasts
+
+
+def test_contacts_come_from_the_meeting_or_the_book_or_read_unknown(recorder):
+    mod = recorder
+    mod.contacts.save_contact("سارة", "sara@tact.sa")
+    llm = ScriptedLlm(meeting_brief={"language": "ar", "summary": ["x"], "decisions": ["d"], "tasks": [
+        {"owner": "فهد", "task": "إرسال العرض", "deadline": "بكرة", "contact": "fahad@tact.sa"},
+        {"owner": "عمر", "task": "حجز القاعة", "deadline": "بكرة", "contact": "omar@invented.com"},
+        {"owner": "ساره", "task": "مراجعة العقد", "deadline": "بكرة"},
+        {"owner": "خالد", "task": "تجهيز الميزانية", "deadline": "بكرة"}]})
+    transcript = "يا فهد أرسل العرض بكرة على fahad@tact.sa وعمر يحجز القاعة"
+    lang, _, tasks = asyncio.run(mod.brief.analyze(llm, transcript))
+    assert [t["contact"] for t in tasks] == ["fahad@tact.sa", "", "", ""]  # never one the meeting didn't say
+    rows = mod.contacts.annotate([dict(t, position=i, status="pending") for i, t in enumerate(tasks, 1)], lang)
+    assert [mod.brief.contact_text(t, lang) for t in rows] == ["fahad@tact.sa", "غير معروف", "sara@tact.sa", "غير معروف"]
+    assert "📞 sara@tact.sa" in mod.brief.task_card(rows[2], 4, lang)  # the book, matched across spellings
+    assert "📞 التواصل: غير معروف" in mod.brief.task_block(rows[3], lang)
+
+
+def test_editing_a_contact_validates_it_and_offers_to_save_it(recorder, telegram_stub):
+    mod = recorder
+    meeting_id = _seed(mod)
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    assert _dispatch(mod, gw, _event(text=f"/brief {meeting_id}", message_type="TEXT")) is None
+    card1 = next(i for i, (text, _) in bot.messages.items() if text.startswith("📋 Task 1 of 3"))
+
+    def reply(text):
+        gw.adapter.sent.clear()
+        assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
+        return gw.adapter.sent
+
+    _press(mod, gw.adapter, f"rec:e:{meeting_id}:1", card1)
+    _press(mod, gw.adapter, f"rec:f:{meeting_id}:1:k", card1)
+    assert gw.adapter.sent[-1] == "Send the contact for task 1: an email address or @username"
+    assert reply("hello there") == ["📞 That is not a contact. Send an email address, a @username or a phone number."]
+    _press(mod, gw.adapter, f"rec:e:{meeting_id}:1", card1)
+    _press(mod, gw.adapter, f"rec:f:{meeting_id}:1:k", card1)
+    reply("@ahmad_k")
+    assert "📞 @ahmad_k (⏳ not registered in the bot yet)" in bot.messages[card1][0]
+    question = max(bot.messages)
+    assert bot.messages[question][0] == "Save this contact for Ahmad for future meetings?"
+    assert mod.contacts.find("Ahmad") is None  # only saved when the manager says so
+    _press(mod, gw.adapter, f"rec:s:y:{meeting_id}:1", question)
+    assert mod.contacts.find("Ahmad")["telegram_username"] == "@ahmad_k"
+    assert "phone numbers can't be messaged yet" in reply("edit 2: contact: +966 50 123 4567")[0]
+
+    reply("confirm all")
+    reply("edit 1: contact: ahmad@tact.sa")  # contacts can still be set after confirmation
+    task1 = mod.store.tasks_for(meeting_id)[0]
+    assert (task1["contact"], task1["status"]) == ("ahmad@tact.sa", "confirmed")
+    assert mod.store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
+
+
+def _invite(mod, gw):
+    gw.adapter._current_bot_username = lambda: "tactbot"
+    gw.adapter.sent.clear()
+    assert _dispatch(mod, gw, _event(text="/invite", message_type="TEXT")) is None
+    (reply,) = gw.adapter.sent
+    m = re.search(r"https://t\.me/tactbot\?start=join_([A-Za-z0-9_-]+)", reply)
+    assert m and "30" in reply
+    return m.group(1)
+
+
+def _join(mod, adapter, token, user=555, username="fahad", name="Fahad K"):
+    message = SimpleNamespace(chat=SimpleNamespace(id=user), text=f"/start join_{token}",
+                              from_user=SimpleNamespace(id=user, username=username, full_name=name))
+    asyncio.run(mod.on_join_message(adapter, message))
+
+
+def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub):
+    mod = recorder
+    _seed(mod)  # a meeting with Ahmad and Omar gives the name buttons
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    token = _invite(mod, gw)
+    assert len(token) >= 22  # >= 16 random bytes
+    with mod.store.connect() as con:  # only a hash is stored
+        assert token not in json.dumps([list(r) for r in con.execute("SELECT * FROM invites").fetchall()])
+
+    _join(mod, gw.adapter, token)
+    assert bot.sent_to(555) == ["⏳ طلبك بانتظار موافقة المدير."]
+    (request_text,) = bot.sent_to(CHAT)
+    assert request_text == "📥 Fahad K (@fahad, 555) يريد استقبال المهام. اربطه بـ:"
+    request_id = max(bot.messages)
+    labels = [b for row in _buttons(bot.messages[request_id][1]) for b, _ in row]
+    assert labels[:2] == ["Ahmad", "Omar"] and labels[-2:] == ["➕ اسم آخر", "❌ رفض"]
+    assert mod.contacts.by_chat_id("555") is None  # nothing registered before the manager decides
+    # Never matched by display name, and nobody but the manager can decide.
+    assert _press(mod, gw.adapter, "rec:j:a:1:1", request_id, user="555") == ["Not allowed."]
+    _press(mod, gw.adapter, "rec:j:a:1:1", request_id)
+    assert mod.contacts.find("Omar")["telegram_chat_id"] == "555"
+    assert bot.sent_to(555)[-1] == "✅ تم تسجيلك لاستقبال المهام."
+    assert bot.messages[request_id] == ("✅ تم ربط Fahad K (@fahad, 555) بـ Omar.", None)
+
+    # "➕ اسم آخر": the manager types the name.
+    _join(mod, gw.adapter, token, user=556, username="", name="Sara")
+    other = max(bot.messages)
+    _press(mod, gw.adapter, "rec:j:o:2", other)
+    assert _dispatch(mod, gw, _event(text="سارة", message_type="TEXT")) is None
+    assert mod.contacts.find("سارة")["telegram_chat_id"] == "556"
+    assert "سارة — ✅ تيليجرام" in mod._cmd_contacts("")
+    assert mod._cmd_contacts("delete سارة") == "🗑️ حُذف سارة." and mod.contacts.find("سارة") is None
+
+
+def test_rejected_expired_revoked_and_rate_limited_joins(recorder, telegram_stub, monkeypatch):
+    mod = recorder
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    token = _invite(mod, gw)
+    _join(mod, gw.adapter, token, user=600)
+    _press(mod, gw.adapter, "rec:j:r:1", max(bot.messages))
+    assert bot.sent_to(600)[-1] == "❌ لم تتم الموافقة على طلبك." and mod.contacts.by_chat_id("600") is None
+
+    invalid = "⛔ الرابط منتهي أو غير صالح. اطلب رابطاً جديداً من المدير."
+    _join(mod, gw.adapter, "x" * 24, user=601)
+    assert bot.sent_to(601) == [invalid]
+    real_now = mod.invite._now
+    monkeypatch.setattr(mod.invite, "_now", lambda: real_now() + 31 * 60)  # 30 minutes have passed
+    _join(mod, gw.adapter, token, user=602)
+    assert bot.sent_to(602) == [invalid]
+    monkeypatch.setattr(mod.invite, "_now", real_now)
+    fresh = _invite(mod, gw)
+    assert _dispatch(mod, gw, _event(text="/invite revoke", message_type="TEXT")) is None
+    _join(mod, gw.adapter, fresh, user=603)
+    assert bot.sent_to(603) == [invalid] and not bot.sent_to(CHAT)[1:]  # the manager heard only of #1
+
+    for _ in range(7):  # at most 5 join attempts per user per hour get any answer
+        _join(mod, gw.adapter, "y" * 24, user=604)
+    assert bot.sent_to(604) == [invalid] * 5
+
+
+def test_a_registered_member_can_use_nothing_else(recorder, telegram_stub, tmp_path):
+    mod = recorder
+    meeting_id = _seed(mod)
+    gw = FakeGateway(bot=True)
+    token = _invite(mod, gw)
+    _join(mod, gw.adapter, token, user=555)
+    _press(mod, gw.adapter, "rec:j:a:1:0", max(gw.adapter._bot.messages))
+    assert mod.contacts.by_chat_id("555")
+
+    member = FakeGateway(authorized=False, bot=True)  # the gateway's allowlist still refuses them
+    for text, mtype in (("hello", "TEXT"), ("/recordings", "COMMAND"), ("/brief 1", "COMMAND"),
+                        ("/invite", "COMMAND"), ("/start", "COMMAND"), ("confirm all", "TEXT")):
+        event = _event(text=text, message_type=mtype, user="555")
+        assert _dispatch(mod, member, event) is event, text  # untouched: the gateway drops it as before
+    voice = _event(message_type="AUDIO", media=[_wav(tmp_path / "m.wav", 1)], user="555",
+                   raw=SimpleNamespace(audio=SimpleNamespace(file_size=32000)))
+    assert _dispatch(mod, member, voice) is voice
+    assert not member.adapter.sent and not member.adapter._bot.messages
+    for text in ("/start", "/start hello", "hello join_" + token, "/start join_x"):
+        assert not mod.invite.JOIN_RE.match(text), text  # only the exact join message is handled early
+    assert _press(mod, gw.adapter, f"rec:c:{meeting_id}:1", 1, user="555") == ["Not allowed."]
+    assert _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", 1, user="555") == ["Not allowed."]
+
+
+class FakeSMTP:
+    sent, logins = [], []
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port, self.tls = host, port, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self, context=None):
+        self.tls = True
+
+    def login(self, user, password):
+        FakeSMTP.logins.append((user, password, self.tls))
+
+    def send_message(self, msg):
+        FakeSMTP.sent.append(msg)
+
+
+def _sending_meeting(mod):
+    language, brief, _ = mod.brief.normalize(ANALYSIS)
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER, manager_name="أبو فيصل")
+    tasks = [{"person": p, "person_key": mod.brief.name_key(p), "candidates": c, "task": t, "deadline": d, "contact": k}
+             for p, c, t, d, k in (
+                 ("Omar", [], "Send the deck", "Tuesday", ""),
+                 ("Sara", [], "Review the contract", "", ""),
+                 ("", ["Omar", "Sara"], "Call the vendor", "", ""),
+                 ("Fahad", [], "Book the venue", "", ""),
+                 ("Omar، Sara", [], "Prepare the launch plan", "Sunday", ""),
+                 ("Omar", [], "Cancelled idea", "", ""),
+                 ("Khalid", [], "Update the website", "", "@khalid_k"))]
+    mod.store.save_analysis(meeting_id, "en", brief, tasks)
+    mod.store.set_task_status(meeting_id, [1, 2, 3, 4, 5, 7], "confirmed")
+    mod.store.set_task_status(meeting_id, [6], "removed")
+    mod.store.update_meeting(meeting_id, status="confirmed")
+    mod.contacts.link_telegram("Omar", "777", "omar_t")
+    mod.contacts.save_contact("Sara", "sara@tact.sa")
+    return meeting_id
+
+
+def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub, monkeypatch, caplog):
+    mod = recorder
+    caplog.set_level(logging.INFO)
+    for var in mod.sending.SMTP_VARS:
+        monkeypatch.delenv(var, raising=False)
+    meeting_id = _sending_meeting(mod)
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    assert _dispatch(mod, gw, _event(text=f"/brief {meeting_id}", message_type="TEXT")) is None
+    ask = max(bot.messages)
+    assert _buttons(bot.messages[ask][1]) == [[("📤 Send tasks", f"rec:x:p:{meeting_id}")]]
+
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)  # the preview sends nothing
+    preview = max(bot.messages)
+    text, markup = bot.messages[preview]
+    assert "👤 Omar — Telegram\n  • 1. Send the deck\n  • 5. Prepare the launch plan" in text
+    for line in ("2. Sara — email sending not configured", "3. ❓ UNCLEAR: Omar or Sara — owner unclear",
+                 "4. Fahad — contact unknown", "5. Sara — email sending not configured",
+                 "7. Khalid — ⏳ not registered in the bot yet"):
+        assert line in text, line
+    assert "Cancelled idea" not in text
+    assert _buttons(markup) == [[("✅ Send", f"rec:x:s:{meeting_id}"), ("❌ Cancel", f"rec:x:c:{meeting_id}")]]
+    assert bot.sent_to("777") == []  # nothing without ✅
+
+    _press(mod, gw.adapter, f"rec:x:c:{meeting_id}", preview)
+    assert bot.messages[preview] == ("Nothing was sent.", None) and bot.sent_to("777") == []
+
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)
+    _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
+    assert bot.sent_to("777") == [f"📋 Your tasks from the meeting on {mod.store.get_meeting(meeting_id, 'telegram', CHAT)['created_at'][:10]}"
+                                  " with أبو فيصل:\n1. Send the deck — Deadline: Tuesday\n"
+                                  "2. Prepare the launch plan — Deadline: Sunday"]
+    tasks = mod.store.tasks_for(meeting_id)
+    assert [t["sent_via"] for t in tasks] == ["telegram", None, None, None, "telegram", None, None]
+    assert gw.adapter.sent[-1].startswith(f"📤 Sending result — Meeting {meeting_id}\n✅ Omar — Telegram: 2 task(s)")
+
+    # Email once SMTP is configured; the joint task now also reaches Sara. Omar's tasks were sent
+    # before, so the preview says they would go again.
+    for var, value in zip(mod.sending.SMTP_VARS, ("smtp.gmail.com", "587", "bot@tact.sa", "app-secret-pw", "bot@tact.sa")):
+        monkeypatch.setenv(var, value)
+    monkeypatch.setattr(mod.sending.smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.sent.clear()
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)
+    assert "👤 Sara — email (sara@tact.sa)\n  • 2. Review the contract\n  • 5. Prepare the launch plan" in \
+        bot.messages[max(bot.messages)][0]
+    assert "were sent before and will be sent again" in bot.messages[max(bot.messages)][0]
+    _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
+    (email,) = FakeSMTP.sent
+    assert email["To"] == "sara@tact.sa" and "Review the contract" in email.get_content()
+    assert FakeSMTP.logins == [("bot@tact.sa", "app-secret-pw", True)]  # STARTTLS before login
+    assert mod.store.tasks_for(meeting_id)[4]["sent_via"] == "telegram,email"
+    assert "app-secret-pw" not in caplog.text and "Send the deck" not in caplog.text

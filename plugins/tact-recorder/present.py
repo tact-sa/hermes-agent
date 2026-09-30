@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import brief as fmt
+from . import contacts
+from . import sending
 from . import store
 from .confirm import Outcome
 
@@ -55,7 +57,9 @@ def _picker_markup(meeting_id: int, position: int, lang: str) -> Any:
     labels = fmt.LABELS[lang]
     return InlineKeyboardMarkup([
         [Button(labels[label], callback_data=f"rec:f:{meeting_id}:{position}:{code}")
-         for label, code in (("btn_name", "n"), ("btn_task", "t"), ("btn_deadline", "d"))],
+         for label, code in (("btn_name", "n"), ("btn_task", "t"))],
+        [Button(labels[label], callback_data=f"rec:f:{meeting_id}:{position}:{code}")
+         for label, code in (("btn_deadline", "d"), ("btn_contact", "k"))],
         [Button(labels["btn_back"], callback_data=f"rec:b:{meeting_id}:{position}")]])
 
 
@@ -89,9 +93,9 @@ async def show_meeting(adapter: Any, platform: str, chat_id: str, meeting_id: in
     """The brief; then any handled tasks in the summary layout; then the pending ones, one card each
     with buttons (or one combined message)."""
     meeting = store.get_meeting(meeting_id, platform, chat_id)
-    tasks = store.tasks_for(meeting_id)
-    pending = [t for t in tasks if t["status"] == "pending"]
     lang = fmt.lang_of(meeting["language"])
+    tasks = contacts.annotate(store.tasks_for(meeting_id), lang)
+    pending = [t for t in tasks if t["status"] == "pending"]
     bot = _bot(adapter, platform)
     cards = bot is not None and 0 < len(pending) <= MAX_CARD_TASKS
     several = cards or 0 < len(pending) < len(tasks)  # "in the following messages" vs "in the next message"
@@ -100,6 +104,7 @@ async def show_meeting(adapter: Any, platform: str, chat_id: str, meeting_id: in
     if len(pending) < len(tasks):
         await send(adapter, chat_id, fmt.final_text(meeting_id, lang, tasks))
     if not pending:
+        await offer_sending(bot, chat_id, meeting_id, lang)
         return
     if cards:
         try:
@@ -128,9 +133,9 @@ async def show_changes(adapter: Any, platform: str, chat_id: str, outcome: Outco
     if not outcome.changed:
         return
     meeting = store.get_meeting(outcome.meeting_id, platform, chat_id)
-    tasks = store.tasks_for(outcome.meeting_id)
-    by_pos = {t["position"]: t for t in tasks}
     lang = fmt.lang_of(meeting["language"])
+    tasks = contacts.annotate(store.tasks_for(outcome.meeting_id), lang)
+    by_pos = {t["position"]: t for t in tasks}
     bot = _bot(adapter, platform)
     for position in outcome.changed:
         task = by_pos[position]
@@ -149,5 +154,42 @@ async def show_changes(adapter: Any, platform: str, chat_id: str, outcome: Outco
         text, markup = _all_message(outcome.meeting_id, sum(t["status"] == "pending" for t in tasks), lang)
         for message_id in all_ids:
             await _edit(bot, chat_id, message_id, text, markup)
+    if outcome.save_contact and bot is not None:
+        await _ask_save_contact(bot, chat_id, outcome.meeting_id, by_pos[outcome.save_contact], lang)
     if outcome.finished:
         await send(adapter, chat_id, fmt.final_text(outcome.meeting_id, lang, tasks))
+        await offer_sending(bot, chat_id, outcome.meeting_id, lang)
+
+
+async def _ask_save_contact(bot: Any, chat_id: str, meeting_id: int, task: Dict[str, Any], lang: str) -> None:
+    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
+    yes, no = ("✅ حفظ", "❌ لا") if lang == "ar" else ("✅ Save", "❌ No")
+    await bot.send_message(
+        chat_id=_chat_arg(chat_id), text=_save_question(lang, task["person"]),
+        reply_markup=InlineKeyboardMarkup([[
+            Button(yes, callback_data=f"rec:s:y:{meeting_id}:{task['position']}"),
+            Button(no, callback_data=f"rec:s:n:{meeting_id}:{task['position']}")]]))
+
+
+def _save_question(lang: str, name: str) -> str:
+    from .confirm import SAVE_CONTACT
+    return SAVE_CONTACT[lang].format(name=name)
+
+
+async def offer_sending(bot: Any, chat_id: str, meeting_id: int, lang: str) -> None:
+    """[📤 Send tasks] under a confirmed meeting (Telegram only: the send needs the manager's tap)."""
+    if bot is not None and sending.has_sendable(meeting_id):
+        await bot.send_message(chat_id=_chat_arg(chat_id), text=sending.ask_text(lang),
+                               reply_markup=sending.markup("ask", meeting_id, lang))
+
+
+async def refresh_cards(adapter: Any, platform: str, chat_id: str, meeting_id: int, positions: List[int]) -> None:
+    """Re-render these task cards in place (e.g. to show "📤 sent via Telegram")."""
+    bot = _bot(adapter, platform)
+    meeting = store.get_meeting(meeting_id, platform, chat_id)
+    lang = fmt.lang_of(meeting["language"])
+    tasks = contacts.annotate(store.tasks_for(meeting_id), lang)
+    for task in tasks:
+        if task["position"] in positions and task["message_id"]:
+            await _edit(bot, chat_id, task["message_id"], fmt.task_card(task, len(tasks), lang),
+                        _card_markup(meeting_id, task, lang))

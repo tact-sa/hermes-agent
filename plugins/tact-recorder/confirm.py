@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import brief as fmt
+from . import contacts
 from . import store
 
 _DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -26,30 +27,42 @@ _CANCEL_RE = re.compile(r"^(?:cancel|remove|delete|إلغاء|الغاء|ألغ|
 _EDIT_RE = re.compile(r"^(?:edit|change|تعديل|عدل|عدّل)\s*#?(\d+)\s*(?:[:：\-–]\s*(.*))?$",
                       re.IGNORECASE | re.DOTALL)
 
-FIELDS = ("person", "task", "deadline")
+FIELDS = ("person", "task", "deadline", "contact")
 # Explicit labels only, each followed by ":" at the start of the text or after a separator. An
 # Arabic label may carry the conjunction "و" ("والموعد:").
 _LABELS = {
     "person": r"الاسم|الإسم|اسم|الشخص|المسؤول|name|owner|person",
     "task": r"المهمة|المهمه|مهمة|task",
     "deadline": r"الموعد|موعد|التاريخ|deadline|due|date",
+    "contact": r"التواصل|تواصل|contact",
 }
 _LABEL_RE = re.compile(
     r"(?:^|(?<=[,،;؛\n]))\s*(?:و\s*)?(?:(?P<person>" + _LABELS["person"] + r")|(?P<task>" + _LABELS["task"]
-    + r")|(?P<deadline>" + _LABELS["deadline"] + r"))\s*[:：]", re.IGNORECASE)
+    + r")|(?P<deadline>" + _LABELS["deadline"] + r")|(?P<contact>" + _LABELS["contact"] + r"))\s*[:：]",
+    re.IGNORECASE)
 
 ASK_FIELD = {
-    "en": ('Which field of task {n}? Tap 👤 Name, 📌 Task or 📅 Deadline, or reply e.g. '
-           '"edit {n}: deadline: Thursday" (fields: name, task, deadline).'),
-    "ar": ('أي حقل تريد تعديله في المهمة {n}؟ اضغط 👤 الاسم أو 📌 المهمة أو 📅 الموعد، أو اكتب مثلاً: '
-           '"تعديل {n}: الموعد: الخميس" (الحقول: الاسم، المهمة، الموعد).'),
+    "en": ('Which field of task {n}? Tap 👤 Name, 📌 Task, 📅 Deadline or 📞 Contact, or reply e.g. '
+           '"edit {n}: deadline: Thursday" (fields: name, task, deadline, contact).'),
+    "ar": ('أي حقل تريد تعديله في المهمة {n}؟ اضغط 👤 الاسم أو 📌 المهمة أو 📅 الموعد أو 📞 التواصل، أو اكتب مثلاً: '
+           '"تعديل {n}: الموعد: الخميس" (الحقول: الاسم، المهمة، الموعد، التواصل).'),
 }
 FIELD_PROMPT = {
     "en": {"person": "Send the new name for task {n}", "task": "Send the new task text for task {n}",
-           "deadline": "Send the new deadline for task {n}"},
+           "deadline": "Send the new deadline for task {n}",
+           "contact": "Send the contact for task {n}: an email address or @username"},
     "ar": {"person": "أرسل الاسم الجديد للمهمة {n}", "task": "أرسل المهمة الجديدة للمهمة {n}",
-           "deadline": "أرسل الموعد الجديد للمهمة {n}"},
+           "deadline": "أرسل الموعد الجديد للمهمة {n}",
+           "contact": "أرسل وسيلة التواصل للمهمة {n}: بريد إلكتروني أو @username"},
 }
+
+
+BAD_CONTACT = {"en": "📞 That is not a contact. Send an email address, a @username or a phone number.",
+               "ar": "📞 هذه ليست وسيلة تواصل. أرسل بريداً إلكترونياً أو @username أو رقم هاتف."}
+PHONE_NOTE = {"en": "📞 Saved, but phone numbers can't be messaged yet; use a @username or an email address.",
+              "ar": "📞 حُفظ الرقم، لكن لا يمكن مراسلة أرقام الهواتف بعد؛ استخدم @username أو البريد الإلكتروني."}
+SAVE_CONTACT = {"en": "Save this contact for {name} for future meetings?",
+                "ar": "حفظ وسيلة التواصل هذه لـ {name} في الاجتماعات القادمة؟"}
 
 
 def parse_command(text: str) -> Optional[Tuple[str, int, str]]:
@@ -93,7 +106,8 @@ class Outcome:
     changed: List[int] = field(default_factory=list)  # task numbers whose card must be refreshed
     acks: Dict[int, str] = field(default_factory=dict)  # text used only when that card can't be edited
     finished: bool = False  # nothing pending any more: the final summary follows
-    picker: int = 0  # task number whose card shows the Name / Task / Deadline choice instead
+    picker: int = 0  # task number whose card shows the Name / Task / Deadline / Contact choice instead
+    save_contact: int = 0  # task number whose new contact the manager is asked to keep in the book
 
 
 def _meeting_lang(meeting: Any) -> str:
@@ -110,11 +124,45 @@ def _update_fields(meeting_id: int, position: int, fields: Dict[str, str]) -> No
 
 
 def _edit_ack(meeting_id: int, position: int, lang: str) -> str:
-    tasks = store.tasks_for(meeting_id)
+    tasks = contacts.annotate(store.tasks_for(meeting_id), lang)
     task = next(t for t in tasks if t["position"] == position)
+    if task["status"] != "pending":
+        return f"✏️ {fmt.task_card(task, len(tasks), lang)}"
     hint = ("أكّدها بـ ✅ أو اكتب \"تأكيد {}\"." if lang == "ar"
             else 'Confirm it with ✅ or reply "confirm {}".').format(position)
     return f"✏️ {fmt.task_card(task, len(tasks), lang)}\n\n{hint}"
+
+
+def _already_confirmed(meeting: Any, lang: str) -> str:
+    return ("الاجتماع #{} مؤكد بالفعل." if lang == "ar" else "Meeting #{} is already confirmed.").format(meeting["id"])
+
+
+def _apply_fields(meeting: Any, position: int, fields: Dict[str, str], lang: str, out: Outcome) -> None:
+    """Store edited fields. A contact must be an email / @username / phone; it keeps the task's
+    status and may change after the meeting is confirmed (contacts are needed to send). The manager
+    is then asked once whether to keep it in the contacts book for that person."""
+    fields = dict(fields)
+    contact = fields.pop("contact", None)
+    if fields:
+        if meeting["status"] != "pending":
+            out.messages.append(_already_confirmed(meeting, lang))
+        else:
+            _update_fields(meeting["id"], position, fields)
+            out.changed = [position]
+    if contact is not None:
+        kind, value = fmt.classify_contact(contact)
+        if not kind:
+            out.messages.append(BAD_CONTACT[lang])
+        else:
+            store.set_task_contact(meeting["id"], position, value)
+            out.changed = [position]
+            if kind == "phone":
+                out.messages.append(PHONE_NOTE[lang])
+            person = next(t["person"] for t in store.tasks_for(meeting["id"]) if t["position"] == position)
+            if len(fmt.split_owners(person)) == 1 and not contacts.has_value(person, value):
+                out.save_contact = position
+    if out.changed:
+        out.acks[position] = _edit_ack(meeting["id"], position, lang)
 
 
 def set_field(meeting: Any, position: int, field_name: str, value: str) -> Outcome:
@@ -122,16 +170,13 @@ def set_field(meeting: Any, position: int, field_name: str, value: str) -> Outco
     lang = _meeting_lang(meeting)
     out = Outcome(meeting["id"])
     value = (value or "").strip()
-    if meeting["status"] != "pending":
-        out.messages.append(("الاجتماع #{} مؤكد بالفعل." if lang == "ar" else "Meeting #{} is already confirmed.")
-                            .format(meeting["id"]))
+    if meeting["status"] != "pending" and field_name != "contact":
+        out.messages.append(_already_confirmed(meeting, lang))
         return out
     if not value:
         out.messages.append(FIELD_PROMPT[lang][field_name].format(n=position))
         return out
-    _update_fields(meeting["id"], position, {field_name: value})
-    out.changed = [position]
-    out.acks[position] = _edit_ack(meeting["id"], position, lang)
+    _apply_fields(meeting, position, {field_name: value}, lang, out)
     return out
 
 
@@ -140,9 +185,9 @@ def apply(meeting: Any, action: str, position: int = 0, edit_text: str = "") -> 
     lang = _meeting_lang(meeting)
     meeting_id = meeting["id"]
     out = Outcome(meeting_id)
-    if meeting["status"] != "pending":
-        out.messages.append(("الاجتماع #{} مؤكد بالفعل." if lang == "ar" else "Meeting #{} is already confirmed.")
-                            .format(meeting_id))
+    fields = parse_labelled(edit_text) if action == "edit" else {}
+    if meeting["status"] != "pending" and not (fields and set(fields) == {"contact"}):
+        out.messages.append(_already_confirmed(meeting, lang))
         return out
     tasks = store.tasks_for(meeting_id)
     by_pos = {t["position"]: t for t in tasks}
@@ -161,14 +206,13 @@ def apply(meeting: Any, action: str, position: int = 0, edit_text: str = "") -> 
                               if action == "confirm" else
                               ("❌ تم إلغاء المهمة {}." if lang == "ar" else "❌ Task {} cancelled.")).format(position)
     elif action == "edit":
-        fields = parse_labelled(edit_text)
         if not fields:
             out.messages.append(ASK_FIELD[lang].format(n=position))
             out.changed, out.picker = [position], position
             return out
-        _update_fields(meeting_id, position, fields)
-        out.changed = [position]
-        out.acks[position] = _edit_ack(meeting_id, position, lang)
+        _apply_fields(meeting, position, fields, lang, out)
+        if meeting["status"] != "pending":
+            return out  # a contact set after confirmation: nothing else changes
     else:
         return out
 

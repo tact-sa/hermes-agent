@@ -21,7 +21,10 @@ the audio deleted, one structured LLM call writes the brief and extracts the tas
 and the tasks go back to the manager for confirmation (``confirm.py``, shown by ``present.py``):
 on Telegram one message per task with its own buttons (``rec:`` callbacks, scoped so the core
 button flows keep working), edited in place as tasks are handled; otherwise one list and text replies.
-Nothing is ever sent to anyone but the manager who sent the recording.
+Nothing goes to anyone but the manager until the manager, after confirming, taps [📤 Send tasks]
+and then ✅ under the preview (``sending.py``): each person then gets only their own confirmed
+tasks, by Telegram (people join through a manager-approved ``/invite`` link, ``invite.py``) or by
+email. How each person is reached lives in the contacts book (``contacts.py``, ``/contacts``).
 
 The brief is retried once inside ``brief.analyze`` when the model returns no usable JSON; if it
 still fails the transcript stays saved and ``/brief <id> retry`` writes the brief again from it
@@ -49,7 +52,10 @@ from typing import Any, Dict, Optional, Tuple
 from . import audio
 from . import brief as fmt
 from . import confirm
+from . import contacts
+from . import invite
 from . import present
+from . import sending
 from . import store
 
 logger = logging.getLogger(__name__)
@@ -71,9 +77,12 @@ _RUNNING: set = set()  # background jobs (kept referenced until done)
 _awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, str, float]] = {}
 # (platform, chat_id) -> expiry after a bare /minutes: the next audio/voice is a recording
 _minutes_armed: Dict[Tuple[str, str], float] = {}
-_BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntd]))?$")
+_BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntdk]))?$")
+# rec:x:<p|s|c>:<meeting> sending, rec:s:<y|n>:<meeting>:<task> save contact, rec:j:<a|o|r>:<request>[:<i>] join
+_EXTRA_RE = re.compile(r"^rec:([xsj]):([a-z]):(\d+)(?::(\d+))?$")
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back"}
-_BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline"}
+_BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline", "k": "contact"}
+_INVITE_RE = re.compile(r"^(?:revoke|cancel|إلغاء|الغاء)?$", re.IGNORECASE)
 _RETRY_RE = re.compile(r"^#?(\d+)\s+retry$", re.IGNORECASE)
 _SHOW_RE = re.compile(r"^#?(\d+)$")
 
@@ -209,7 +218,8 @@ def _start_job(coro: Any) -> None:
 
 
 def _start_recording(gateway: Any, source: Any, path: str, note: str) -> int:
-    meeting_id = store.create_meeting(_platform(source), str(source.chat_id), str(source.user_id), note)
+    meeting_id = store.create_meeting(_platform(source), str(source.chat_id), str(source.user_id), note,
+                                      fmt.clean(getattr(source, "user_name", "") or ""))
     src = Path(path)
     dest = store.meeting_dir(meeting_id) / f"audio{src.suffix.lower() or '.bin'}"
     shutil.move(str(src), dest)
@@ -252,6 +262,8 @@ def _text_replies(platform: str, chat_id: str, text: str) -> Optional[confirm.Ou
     if command is None:
         return None
     meeting = store.latest_pending(platform, chat_id)
+    if meeting is None and command[0] == "edit":
+        meeting = store.latest_briefed(platform, chat_id)  # contacts can still be set after confirmation
     if meeting is None:
         return None
     return confirm.apply(meeting, *command)
@@ -270,8 +282,10 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
     kind, path = classify(event, int(getattr(adapter, "_max_doc_bytes", 0) or TELEGRAM_MAX_BYTES), force)
     brief_args = event.get_command_args().strip() if command == "brief" and not has_attachment else ""
     retry, show = _RETRY_RE.match(brief_args), _SHOW_RE.match(brief_args)
+    invite_cmd = (command == "invite" and not has_attachment and key[0] == "telegram"
+                  and _INVITE_RE.match(event.get_command_args().strip()))
     # Other commands (a bare /minutes included) go on to the gateway's command dispatch.
-    if not kind and not retry and not show and (has_attachment or not text.strip() or command):
+    if not kind and not retry and not show and not invite_cmd and (has_attachment or not text.strip() or command):
         return None
     # Only the manager: anyone else continues to the gateway's normal refusal / pairing path.
     if not gateway._is_user_authorized_for_source(source):
@@ -281,6 +295,15 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
     if command == "minutes":
         text = event.get_command_args()
     async with _profile_scope(gateway, source):
+        if invite_cmd:
+            await _send(adapter, source.chat_id, _invite_reply(adapter, source, invite_cmd.group(0)))
+            return {"action": "skip", "reason": "tact-recorder: invite"}
+        if not command and not has_attachment:
+            typed = await invite.take_typed_name(getattr(adapter, "_bot", None), *key, str(source.user_id), text)
+            if typed is not None:  # the name for a join request after "➕ اسم آخر"
+                for reply in typed:
+                    await _send(adapter, source.chat_id, reply)
+                return {"action": "skip", "reason": "tact-recorder: join name"}
         if retry:
             # Handled here, not in the /brief command, because the retry replies later from the
             # background through the adapter, which only this hook can reach.
@@ -338,8 +361,71 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
     return confirm.apply(meeting, action, position), ""
 
 
+def _invite_reply(adapter: Any, source: Any, args: str) -> str:
+    if args:
+        return f"🚫 أُلغيت روابط الدعوة النشطة ({invite.revoke_invites(str(source.user_id))})."
+    finder = getattr(adapter, "_current_bot_username", None)
+    username = finder() if callable(finder) else (getattr(getattr(adapter, "_bot", None), "username", "") or "")
+    if not username:
+        return "تعذّر معرفة اسم البوت؛ حاول مرة أخرى بعد قليل."
+    token, expires_at = invite.create_invite(_platform(source), str(source.chat_id), str(source.user_id))
+    return invite.invite_text(username.lstrip("@"), token, expires_at)
+
+
+async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: str, message_id: Any) -> str:
+    """Sending, save-contact and join buttons; returns the toast. Each checks the presser is the
+    manager the meeting (or the invite) belongs to."""
+    m = _EXTRA_RE.match(data or "")
+    if not m:
+        return ""
+    kind, action, number, extra = m.group(1), m.group(2), int(m.group(3)), int(m.group(4) or 0)
+    bot = getattr(adapter, "_bot", None)
+    if kind == "j":
+        messages, toast = await invite.handle_button(bot, action, number, extra, chat_id, user_id)
+        for text in messages:
+            await _send(adapter, chat_id, text)
+        return toast
+    meeting = sending.resolve_meeting(number, "telegram", chat_id, user_id)
+    if meeting is None:
+        return "Not allowed."
+    lang = fmt.lang_of(meeting["language"])
+    if kind == "s":
+        task = next((t for t in store.tasks_for(number) if t["position"] == extra), None)
+        if task is None or not task["contact"]:
+            return "✔️"
+        if action == "y":
+            contacts.save_contact(task["person"], task["contact"])
+            text = (f"✅ حُفظت وسيلة التواصل لـ {task['person']}." if lang == "ar"
+                    else f"✅ Contact saved for {task['person']}.")
+        else:
+            text = "لم تُحفظ." if lang == "ar" else "Not saved."
+        await present._edit(bot, chat_id, message_id, text, None)
+        return ""
+    if action == "p":  # preview only: nothing is sent from here
+        plan = sending.plan(number)
+        await bot.send_message(chat_id=present._chat_arg(chat_id), text=sending.preview_text(number, lang, plan),
+                               reply_markup=sending.markup("confirm", number, lang) if plan["recipients"] else None)
+        return ""
+    if action == "c":
+        await present._edit(bot, chat_id, message_id, sending.cancelled_text(lang), None)
+        return ""
+    # action == "s": the manager's explicit ✅ under the preview
+    await present._edit(bot, chat_id, message_id, "📤 …", None)  # no second tap on the same preview
+    report, sent = await sending.execute(bot, meeting, lang, sending.plan(number))
+    await present.refresh_cards(adapter, "telegram", chat_id, number, sent)
+    await _send(adapter, chat_id, report)
+    return ""
+
+
+async def on_join_message(adapter: Any, message: Any) -> None:
+    """A private ``/start join_<token>``: handled here, before the allowlist prefilter would drop it."""
+    user = message.from_user
+    await invite.handle_join(adapter._bot, str(message.chat.id), str(user.id), user.username or "",
+                             getattr(user, "full_name", "") or "", message.text or "")
+
+
 def _telegram_handlers(app: Any, adapter: Any) -> None:
-    from telegram.ext import CallbackQueryHandler
+    from telegram.ext import CallbackQueryHandler, MessageHandler, filters
 
     async def on_button(update: Any, _context: Any) -> None:
         accept = getattr(adapter, "_accept_update", None)
@@ -347,6 +433,11 @@ def _telegram_handlers(app: Any, adapter: Any) -> None:
             accept()
         query = update.callback_query
         chat_id = str(query.message.chat.id)
+        if _EXTRA_RE.match(query.data or ""):
+            toast = await handle_extra_button(adapter, query.data, chat_id, str(query.from_user.id),
+                                              query.message.message_id)
+            await query.answer(toast or None)
+            return
         outcome, toast = handle_button(query.data, "telegram", chat_id, str(query.from_user.id))
         await query.answer(toast or None)
         if outcome is not None:
@@ -354,7 +445,15 @@ def _telegram_handlers(app: Any, adapter: Any) -> None:
             await present.show_changes(adapter, "telegram", chat_id, outcome,
                                        pressed={position: query.message.message_id})
 
+    async def on_join(update: Any, _context: Any) -> None:
+        accept = getattr(adapter, "_accept_update", None)
+        if callable(accept):
+            accept()
+        await on_join_message(adapter, update.effective_message)
+
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^rec:"))
+    # Exactly "/start join_<token>" in a private chat; every other message keeps the core path.
+    app.add_handler(MessageHandler(filters.Regex(invite.JOIN_RE) & filters.ChatType.PRIVATE, on_join))
 
 
 # -- slash commands ------------------------------------------------------------------------------
@@ -366,6 +465,20 @@ def _chat() -> Tuple[str, str]:
 
 _MEETING_STATUS = {"transcribing": "🎙️ transcribing", "analyzing": "📝 writing the brief",
                    "pending": "⏳ awaiting confirmation", "confirmed": "✅ confirmed", "failed": "⚠️ failed"}
+
+
+def _cmd_invite(_raw_args: str) -> str:
+    """Only reached where the hook did not answer (not a private Telegram chat)."""
+    return "Use /invite in your private chat with the bot on Telegram."
+
+
+def _cmd_contacts(raw_args: str) -> str:
+    args = str(raw_args or "").strip()
+    m = re.match(r"^(?:delete|remove|حذف|احذف)\s+(.+)$", args, re.IGNORECASE)
+    if m:
+        name = fmt.clean(m.group(1))
+        return f"🗑️ حُذف {name}." if contacts.delete(name) else f"لا توجد جهة اتصال باسم {name}."
+    return contacts.list_text()
 
 
 def _cmd_minutes(_raw_args: str) -> str:
@@ -410,7 +523,8 @@ def _cmd_brief(raw_args: str) -> str:
     if status is not None:
         return status
     meeting = store.get_meeting(meeting_id, platform, chat_id)
-    lang, tasks = fmt.lang_of(meeting["language"]), store.tasks_for(meeting_id)
+    lang = fmt.lang_of(meeting["language"])
+    tasks = contacts.annotate(store.tasks_for(meeting_id), lang)
     pending = [t for t in tasks if t["status"] == "pending"]
     text = fmt.brief_text(meeting_id, meeting["created_at"], lang, json.loads(meeting["brief"]), len(tasks), False)
     if len(pending) < len(tasks):
@@ -427,6 +541,9 @@ def register(ctx) -> None:
     ctx.register_telegram_handler(_telegram_handlers)
     ctx.register_command("minutes", _cmd_minutes,
                          description="Take meeting minutes from next audio")
+    ctx.register_command("invite", _cmd_invite,
+                         description="Invite link so a team member can receive tasks")
+    ctx.register_command("contacts", _cmd_contacts, description="Who can receive tasks, and how")
     ctx.register_command("recordings", _cmd_recordings, description="List recent recorded meetings")
     ctx.register_command("brief", _cmd_brief, description="Show a recorded meeting's brief and tasks",
                          args_hint="<id>")

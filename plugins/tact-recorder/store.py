@@ -1,8 +1,9 @@
 """SQLite storage for recorded meetings: ``<home>/recordings/recordings.db``.
 
 One row per meeting (who sent it, when, transcript path, brief) and one row per extracted task.
-``tasks.person_key`` (normalised name) and ``tasks.sent_at`` are there so "send each person their
-tasks" can be added later without a migration; nothing reads them yet.
+``tasks.contact`` is a contact said in the meeting or set by the manager (the contacts book in
+``contacts.py`` fills the rest); ``tasks.sent_at`` / ``sent_via`` record when and how a confirmed
+task was sent to its owner.
 """
 
 from __future__ import annotations
@@ -58,7 +59,8 @@ def connect() -> sqlite3.Connection:
     # Columns added after the first release, added in place to existing databases: the caption note
     # (feeds "/brief <id> retry") and the Telegram message ids of each task card and of the
     # "Confirm all" message (edited in place when a task changes).
-    for table, column in (("meetings", "note"), ("meetings", "confirm_message_id"), ("tasks", "message_id")):
+    for table, column in (("meetings", "note"), ("meetings", "confirm_message_id"), ("meetings", "manager_name"),
+                          ("tasks", "message_id"), ("tasks", "contact"), ("tasks", "sent_via")):
         if column not in {row[1] for row in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
     return con
@@ -68,11 +70,12 @@ def now() -> datetime:
     return datetime.now(TZ)
 
 
-def create_meeting(platform: str, chat_id: str, user_id: str, note: str = "") -> int:
+def create_meeting(platform: str, chat_id: str, user_id: str, note: str = "", manager_name: str = "") -> int:
     with connect() as con:
         return con.execute(
-            "INSERT INTO meetings (platform, chat_id, user_id, created_at, note) VALUES (?, ?, ?, ?, ?)",
-            (platform, chat_id, user_id, now().isoformat(timespec="seconds"), note)).lastrowid
+            "INSERT INTO meetings (platform, chat_id, user_id, created_at, note, manager_name)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (platform, chat_id, user_id, now().isoformat(timespec="seconds"), note, manager_name)).lastrowid
 
 
 def update_meeting(meeting_id: int, **fields: Any) -> None:
@@ -87,10 +90,10 @@ def save_analysis(meeting_id: int, language: str, brief: Dict[str, Any], tasks: 
                     (language, json.dumps(brief, ensure_ascii=False),
                      "pending" if tasks else "confirmed", meeting_id))
         con.executemany(
-            "INSERT INTO tasks (meeting_id, position, person, person_key, candidates, task, deadline)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (meeting_id, position, person, person_key, candidates, task, deadline, contact)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [(meeting_id, i, t["person"], t["person_key"], json.dumps(t["candidates"], ensure_ascii=False),
-              t["task"], t["deadline"]) for i, t in enumerate(tasks, 1)])
+              t["task"], t["deadline"], t.get("contact") or "") for i, t in enumerate(tasks, 1)])
 
 
 def get_meeting(meeting_id: int, platform: str, chat_id: str) -> Optional[sqlite3.Row]:
@@ -104,6 +107,26 @@ def latest_pending(platform: str, chat_id: str) -> Optional[sqlite3.Row]:
         return con.execute(
             "SELECT * FROM meetings WHERE platform = ? AND chat_id = ? AND status = 'pending'"
             " ORDER BY id DESC LIMIT 1", (platform, chat_id)).fetchone()
+
+
+def latest_briefed(platform: str, chat_id: str) -> Optional[sqlite3.Row]:
+    """The chat's latest meeting with a brief, confirmed or not (contact edits after confirmation)."""
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM meetings WHERE platform = ? AND chat_id = ? AND brief IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1", (platform, chat_id)).fetchone()
+
+
+def recent_people(platform: str, chat_id: str, meetings: int = 10) -> List[str]:
+    """Names from the chat's latest meetings (owners, and the candidates of unclear tasks), most
+    recent first; joint owners stay joined ("أحمد، عمر")."""
+    with connect() as con:
+        rows = con.execute(
+            "SELECT t.person, t.candidates FROM tasks t JOIN meetings m ON m.id = t.meeting_id"
+            " WHERE m.platform = ? AND m.chat_id = ?"
+            " AND m.id IN (SELECT id FROM meetings WHERE platform = ? AND chat_id = ? ORDER BY id DESC LIMIT ?)"
+            " ORDER BY m.id DESC, t.position", (platform, chat_id, platform, chat_id, meetings)).fetchall()
+    return [n for r in rows for n in ([r["person"]] if r["person"] else json.loads(r["candidates"] or "[]"))]
 
 
 def recent_meetings(platform: str, chat_id: str, limit: int = 10) -> List[sqlite3.Row]:
@@ -135,6 +158,20 @@ def set_task_message(meeting_id: int, position: int, message_id: Any) -> None:
     with connect() as con:
         con.execute("UPDATE tasks SET message_id = ? WHERE meeting_id = ? AND position = ?",
                     (str(message_id), meeting_id, position))
+
+
+def set_task_contact(meeting_id: int, position: int, contact: str) -> None:
+    """A contact is not part of what the manager confirms, so setting one keeps the task's status."""
+    with connect() as con:
+        con.execute("UPDATE tasks SET contact = ? WHERE meeting_id = ? AND position = ?",
+                    (contact, meeting_id, position))
+
+
+def mark_sent(meeting_id: int, position: int, channels: List[str]) -> None:
+    stamp = now().isoformat(timespec="seconds")
+    with connect() as con:
+        con.execute("UPDATE tasks SET sent_at = ?, sent_via = ? WHERE meeting_id = ? AND position = ?",
+                    (stamp, ",".join(dict.fromkeys(channels)), meeting_id, position))
 
 
 def update_task(meeting_id: int, position: int, **fields: Any) -> None:
