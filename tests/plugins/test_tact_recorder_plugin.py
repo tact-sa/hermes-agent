@@ -1024,7 +1024,7 @@ def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub
     _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)
     _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
     date = mod.store.get_meeting(meeting_id, "telegram", CHAT)["created_at"][:10]
-    assert bot.sent_to("777") == [f"📋 Your tasks from the meeting on {date} with أبو فيصل:\n"
+    assert bot.sent_to("777") == [f"👤 Omar\n📋 Your tasks from the meeting on {date} with أبو فيصل:\n"
                                   "1. Send the deck — Deadline: Tuesday\n2. Prepare the launch plan — Deadline: Sunday"]
     assert [t["sent_via"] for t in mod.store.tasks_for(meeting_id)] == \
         ["telegram", None, None, None, "telegram", None, None]
@@ -1357,3 +1357,33 @@ def test_a_confirmed_task_can_be_undone_edited_and_sent_again(recorder, telegram
     _press(mod, gw.adapter, f"rec:x:r:{meeting_id}:1", offer)
     assert bot.sent_to("801")[-1].endswith("1. Send the Q3 budget — Deadline: Thursday")
     assert len(bot.sent_to("801")) == 2
+
+
+def test_linked_members_show_as_full_name_and_role_others_keep_the_meeting_name(recorder, telegram_stub):
+    mod = recorder
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER, manager_name="أبو فيصل")
+    mod.store.save_analysis(meeting_id, "ar", {"summary": ["x"]}, [
+        {"person": p, "person_key": mod.brief.name_key(p), "candidates": [], "task": t, "deadline": "الأحد"}
+        for p, t in (("أحمد", "تجهيز الخطة"), ("خالد", "حجز القاعة"), ("أحمد، خالد", "زيارة العميل"),
+                     ("المدير", "مكالمة المالية"))])
+    mod.contacts.link_telegram("أحمد", "801", "ahmad_s")
+    mod.contacts.set_details("أحمد", full_name="أحمد السالم", role="مطور")  # joined via /invite; خالد did not
+    tasks = mod.contacts.annotate(mod.store.tasks_for(meeting_id), "ar")
+    card = mod.brief.task_card(tasks[0], 4, "ar")
+    assert "\n👤 أحمد السالم (مطور)\n" in card
+    assert "\n👤 خالد\n" in mod.brief.task_card(tasks[1], 4, "ar")  # not joined: the meeting's name
+    assert "\n👤 أحمد السالم (مطور)، خالد\n" in mod.brief.task_card(tasks[2], 4, "ar")
+    assert "\n👤 المدير (أنت)\n" in mod.brief.task_card(tasks[3], 4, "ar")
+    mod.store.set_task_status(meeting_id, [1, 2, 3, 4], "confirmed")
+    mod.store.update_meeting(meeting_id, status="confirmed")
+    summary = mod.brief.final_text(meeting_id, "ar", mod.contacts.annotate(mod.store.tasks_for(meeting_id), "ar"))
+    assert "1.\n👤 الاسم: أحمد السالم (مطور)\n" in summary and "2.\n👤 الاسم: خالد\n" in summary
+    mod.store.set_task_status(meeting_id, [4], "removed")  # /brief: handled tasks in the same layout
+    from gateway.session_context import get_session_env  # noqa: F401  (session env set by the fixture)
+    assert "👤 الاسم: أحمد السالم (مطور)" in mod._cmd_brief(str(meeting_id))
+
+    gw = FakeGateway(bot=True)
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", 1)
+    _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(gw.adapter._bot.messages))
+    (message,) = gw.adapter._bot.sent_to("801")
+    assert message.startswith("👤 أحمد السالم (مطور)\n📋 مهامك من اجتماع ")

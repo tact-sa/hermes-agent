@@ -578,6 +578,8 @@ async def _fill_gaps(llm: Any, transcript: str, language: str, brief: Dict[str, 
 # renders scrambled inside right-to-left Arabic text.
 
 def owner_text(task: Dict[str, Any], lang: str, question: bool = True) -> str:
+    if task.get("owner_display"):  # set by contacts.annotate: members as "full name (role)"
+        return task["owner_display"]
     if task["person"]:
         names = split_owners(task["person"])
         if not any(is_manager(n) for n in names):

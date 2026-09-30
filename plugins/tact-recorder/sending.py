@@ -134,11 +134,12 @@ def preview_text(meeting_id: int, lang: str, p: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def message_text(meeting: Any, lang: str, tasks: List[Dict[str, Any]]) -> str:
+def message_text(meeting: Any, lang: str, tasks: List[Dict[str, Any]], who: str = "") -> str:
+    """The member's message; *who* is how they are known ("full name (role)")."""
     text = TEXT[lang]
     header = text["header"].format(date=meeting["created_at"][:10], manager=meeting["manager_name"] or text["manager"])
     missing = fmt.LABELS[lang]["missing"]
-    return header + "\n" + "\n".join(
+    return (f"👤 {who}\n" if who else "") + header + "\n" + "\n".join(
         text["line"].format(i=i, task=t["task"], deadline=t["deadline"] or missing) for i, t in enumerate(tasks, 1))
 
 
@@ -159,7 +160,7 @@ async def execute(bot: Any, meeting: Any, lang: str, p: Dict[str, Any]) -> Tuple
     channels: Dict[int, List[str]] = {}
     sent = 0
     for r in p["recipients"]:
-        body = message_text(meeting, lang, r["tasks"])
+        body = message_text(meeting, lang, r["tasks"], r["name"])
         channel_name = text[f"channel_{r['channel']}"]
         try:
             if r["channel"] == "telegram":

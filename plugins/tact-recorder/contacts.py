@@ -298,10 +298,28 @@ def display(task: Dict[str, Any], lang: str) -> str:
     return "، ".join(parts)
 
 
+def owner_display(task: Dict[str, Any], lang: str) -> str:
+    """Each owner as the manager should read them: a linked registered member as "full name
+    (role)", the manager as "(you)", anyone else (not joined, or a name fitting several members)
+    by the short name the meeting used. "" for an unclear owner (``brief.owner_text`` handles it)."""
+    names = fmt.split_owners(task["person"])
+    chosen = by_id(task["contact_id"]) if len(names) == 1 and task.get("contact_id") else None
+    shown = []
+    for name in names:
+        if fmt.is_manager(name):
+            shown.append(f"{fmt.LABELS[lang]['manager']} ({fmt.LABELS[lang]['you']})")
+            continue
+        found = [chosen] if is_member(chosen) else members_for(name)
+        shown.append(label(found[0]) if len(found) == 1 else name)
+    return "، ".join(shown)
+
+
 def annotate(tasks: List[Dict[str, Any]], lang: str) -> List[Dict[str, Any]]:
-    """Add each task's ``contact_display`` (what cards, summaries and /brief show). In place."""
+    """Add each task's ``contact_display`` and ``owner_display`` (what cards, summaries and /brief
+    show). In place."""
     for task in tasks:
         task["contact_display"] = display(task, lang)
+        task["owner_display"] = owner_display(task, lang)
     return tasks
 
 
