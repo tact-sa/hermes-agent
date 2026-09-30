@@ -24,6 +24,7 @@ _ONE_RE = re.compile(rf"^{_CONFIRM}\s*#?(\d+)$", re.IGNORECASE)
 # "حذف" (the old wording) stays accepted next to "إلغاء".
 _CANCEL_RE = re.compile(r"^(?:cancel|remove|delete|إلغاء|الغاء|ألغ|الغ|حذف|احذف|إزالة|ازالة)\s*#?(\d+)$",
                         re.IGNORECASE)
+_UNDO_RE = re.compile(r"^(?:undo|restore|تراجع|تراجع\s+عن|استرجاع|استعادة)\s*#?(\d+)$", re.IGNORECASE)
 _EDIT_RE = re.compile(r"^(?:edit|change|تعديل|عدل|عدّل)\s*#?(\d+)\s*(?:[:：\-–]\s*(.*))?$",
                       re.IGNORECASE | re.DOTALL)
 
@@ -55,17 +56,19 @@ FIELD_PROMPT = {
 }
 
 
+SENT_WARNING = {"ar": "⚠️ هذه المهمة أُرسلت — التعديل لن يُرسل تلقائياً",
+                "en": "⚠️ This task was already sent — the edit will not be sent automatically"}
 CONTACTS_FROM_INVITES = {
     "en": "📞 Contacts can't be typed: they come only from members who joined through /invite. Pick one:",
     "ar": "📞 لا تُكتب وسيلة التواصل يدوياً: التواصل يكون فقط مع الأعضاء الذين انضموا عبر /invite. اختر عضواً:"}
 
 
 def parse_command(text: str) -> Optional[Tuple[str, int, str]]:
-    """``(action, number, edit_text)`` for a confirmation reply; action in all/confirm/remove/edit."""
+    """``(action, number, edit_text)`` for a confirmation reply; action in all/confirm/remove/undo/edit."""
     text = (text or "").translate(_DIGITS).strip()
     if _ALL_RE.match(text):
         return "all", 0, ""
-    for action, regex in (("confirm", _ONE_RE), ("remove", _CANCEL_RE)):
+    for action, regex in (("confirm", _ONE_RE), ("remove", _CANCEL_RE), ("undo", _UNDO_RE)):
         m = regex.match(text)
         if m:
             return action, int(m.group(1)), ""
@@ -103,6 +106,7 @@ class Outcome:
     finished: bool = False  # nothing pending any more: the final summary follows
     picker: int = 0  # task number whose card shows the Name / Task / Deadline / Contact choice instead
     member_picker: int = 0  # task number for which the registered members are offered as its contact
+    resend: int = 0  # a task that was already sent and has just been edited: offer to send it again
 
 
 def _meeting_lang(meeting: Any) -> str:
@@ -128,21 +132,16 @@ def _edit_ack(meeting_id: int, position: int, lang: str) -> str:
     return f"✏️ {fmt.task_card(task, len(tasks), lang)}\n\n{hint}"
 
 
-def _already_confirmed(meeting: Any, lang: str) -> str:
-    return ("الاجتماع #{} مؤكد بالفعل." if lang == "ar" else "Meeting #{} is already confirmed.").format(meeting["id"])
-
-
 def _apply_fields(meeting: Any, position: int, fields: Dict[str, str], lang: str, out: Outcome) -> None:
     """Store edited fields. A typed contact is refused: the manager picks a registered member
     instead (``member_picker``), which also works after the meeting is confirmed."""
     fields = dict(fields)
     contact = fields.pop("contact", None)
-    if fields:
-        if meeting["status"] != "pending":
-            out.messages.append(_already_confirmed(meeting, lang))
-        else:
-            _update_fields(meeting["id"], position, fields)
-            out.changed = [position]
+    if fields:  # any time, confirmed or not; the task keeps its status
+        _update_fields(meeting["id"], position, fields)
+        out.changed = [position]
+        if any(t["position"] == position and t["sent_at"] for t in store.tasks_for(meeting["id"])):
+            out.resend = position
     if contact is not None:
         out.messages.append(CONTACTS_FROM_INVITES[lang])
         out.member_picker = position
@@ -155,9 +154,6 @@ def set_field(meeting: Any, position: int, field_name: str, value: str) -> Outco
     lang = _meeting_lang(meeting)
     out = Outcome(meeting["id"])
     value = (value or "").strip()
-    if meeting["status"] != "pending":
-        out.messages.append(_already_confirmed(meeting, lang))
-        return out
     if not value:
         out.messages.append(FIELD_PROMPT[lang][field_name].format(n=position))
         return out
@@ -165,15 +161,18 @@ def set_field(meeting: Any, position: int, field_name: str, value: str) -> Outco
     return out
 
 
+def was_sent(meeting_id: int, position: int) -> bool:
+    return any(t["position"] == position and t["sent_at"] for t in store.tasks_for(meeting_id))
+
+
 def apply(meeting: Any, action: str, position: int = 0, edit_text: str = "") -> Outcome:
-    """Apply one confirmation action to *meeting* (a store row)."""
+    """Apply one confirmation action to *meeting* (a store row). Edits and ↩️ undo work at any time;
+    the meeting is (re)confirmed, with the final summary, whenever its last pending task is handled."""
     lang = _meeting_lang(meeting)
     meeting_id = meeting["id"]
     out = Outcome(meeting_id)
+    was_pending = meeting["status"] == "pending"
     fields = parse_labelled(edit_text) if action == "edit" else {}
-    if meeting["status"] != "pending" and not (fields and set(fields) == {"contact"}):
-        out.messages.append(_already_confirmed(meeting, lang))
-        return out
     tasks = store.tasks_for(meeting_id)
     by_pos = {t["position"]: t for t in tasks}
     if action != "all" and position not in by_pos:
@@ -190,14 +189,26 @@ def apply(meeting: Any, action: str, position: int = 0, edit_text: str = "") -> 
         out.acks[position] = (("✅ تم تأكيد المهمة {}." if lang == "ar" else "✅ Task {} confirmed.")
                               if action == "confirm" else
                               ("❌ تم إلغاء المهمة {}." if lang == "ar" else "❌ Task {} cancelled.")).format(position)
+    elif action == "undo":
+        if by_pos[position]["status"] == "pending":
+            out.messages.append(("المهمة {} بانتظار التأكيد أصلاً." if lang == "ar"
+                                 else "Task {} is already waiting for confirmation.").format(position))
+            return out
+        store.set_task_status(meeting_id, [position], "pending")
+        if not was_pending:  # the meeting is open again until this task is handled
+            store.update_meeting(meeting_id, status="pending")
+        out.changed = [position]
+        out.acks[position] = ("↩️ أُعيدت المهمة {} إلى الانتظار." if lang == "ar"
+                              else "↩️ Task {} is waiting for confirmation again.").format(position)
     elif action == "edit":
+        if was_sent(meeting_id, position):
+            out.messages.append(SENT_WARNING[lang])
         if not fields:
             out.messages.append(ASK_FIELD[lang].format(n=position))
             out.changed, out.picker = [position], position
             return out
         _apply_fields(meeting, position, fields, lang, out)
-        if meeting["status"] != "pending":
-            return out  # a contact set after confirmation: nothing else changes
+        return out  # an edit changes no status
     else:
         return out
 
@@ -207,6 +218,7 @@ def apply(meeting: Any, action: str, position: int = 0, edit_text: str = "") -> 
             out.acks[position] += (f" (متبقٍ {len(pending)} للتأكيد)" if lang == "ar"
                                    else f" ({len(pending)} still to confirm)")
         return out
-    store.update_meeting(meeting_id, status="confirmed")
-    out.finished = True
+    if was_pending:
+        store.update_meeting(meeting_id, status="confirmed")
+        out.finished = True
     return out

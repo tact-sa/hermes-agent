@@ -9,12 +9,14 @@
 # tact-consult answers "/consult <question>" as an executive strategy consultant (only when typed).
 # tact-recorder turns a meeting recording the manager sends into a transcript, a brief and a task
 # list that goes back to the manager only, for confirmation (/recordings, /brief <id>).
+# tact-clock tells the model the real current date and time (Riyadh) on every turn.
 plugins:
   enabled:
     - tact-guard
     - tact-meetings
     - tact-consult
     - tact-recorder
+    - tact-clock
   # Lets tact-recorder send the meeting brief to the model named in tact_recorder.brief_model
   # (below); no other plugin and no chat turn is affected.
   entries:

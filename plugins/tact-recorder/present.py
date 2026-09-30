@@ -41,14 +41,19 @@ def _chat_arg(chat_id: str) -> Any:
     return int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
 
 
+_CARD_BUTTONS = {  # a confirmed task can still be edited or undone; a cancelled one restored
+    "pending": (("btn_confirm", "c"), ("btn_edit", "e"), ("btn_remove", "r")),
+    "confirmed": (("btn_edit", "e"), ("btn_undo", "u")),
+    "removed": (("btn_undo", "u"),),
+}
+
+
 def _card_markup(meeting_id: int, task: Dict[str, Any], lang: str) -> Any:
-    if task["status"] != "pending":
-        return None
     from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
     labels = fmt.LABELS[lang]
     return InlineKeyboardMarkup([[
         Button(labels[label], callback_data=f"rec:{code}:{meeting_id}:{task['position']}")
-        for label, code in (("btn_confirm", "c"), ("btn_edit", "e"), ("btn_remove", "r"))]])
+        for label, code in _CARD_BUTTONS.get(task["status"], ())]])
 
 
 def _picker_markup(meeting_id: int, position: int, lang: str) -> Any:
@@ -161,6 +166,9 @@ async def show_changes(adapter: Any, platform: str, chat_id: str, outcome: Outco
             await _edit(bot, chat_id, message_id, text, markup)
     if outcome.member_picker:
         await send_member_picker(adapter, bot, chat_id, outcome.meeting_id, by_pos[outcome.member_picker], lang)
+    if outcome.resend and bot is not None:  # an edited task that was already sent: offer, never automatic
+        await bot.send_message(chat_id=_chat_arg(chat_id), text=sending.resend_ask_text(outcome.resend, lang),
+                               reply_markup=sending.resend_markup(outcome.meeting_id, outcome.resend, lang))
     if outcome.finished:
         await send(adapter, chat_id, fmt.final_text(outcome.meeting_id, lang, tasks))
         await offer_sending(bot, chat_id, outcome.meeting_id, lang)

@@ -48,6 +48,7 @@ LABELS = {
            "name": "Name", "task": "Task", "deadline": "Deadline", "contact": "Contact", "btn_contact": "📞 Contact",
            "registered": "✅ {username} (registered)", "registered_plain": "✅ registered",
            "not_joined": "⏳ not joined yet — send /invite", "no_owner": "—",
+           "manager": "Manager", "you": "you", "self_task": "— your task", "btn_undo": "↩️ Undo",
            "sent_telegram": "📤 Sent via Telegram", "sent_email": "📤 Sent by email",
            "confirm_all": "✅ Confirm all ({n})", "all_prompt": "Confirm all remaining tasks at once:",
            "all_done": "✅ All tasks handled.",
@@ -65,6 +66,7 @@ LABELS = {
            "name": "الاسم", "task": "المهمة", "deadline": "الموعد", "contact": "التواصل", "btn_contact": "📞 التواصل",
            "registered": "✅ {username} (مسجل)", "registered_plain": "✅ مسجل",
            "not_joined": "⏳ لم ينضم بعد — أرسل /invite", "no_owner": "—",
+           "manager": "المدير", "you": "أنت", "self_task": "— مهمتك", "btn_undo": "↩️ تراجع",
            "sent_telegram": "📤 أُرسلت عبر تيليجرام", "sent_email": "📤 أُرسلت بالبريد الإلكتروني",
            "confirm_all": "✅ تأكيد الكل ({n})", "all_prompt": "تأكيد كل المهام المتبقية دفعة واحدة:",
            "all_done": "✅ تم التعامل مع كل المهام.",
@@ -96,6 +98,10 @@ summary, decisions and open_issues are lists of plain strings: one sentence per 
   The deadline goes ONLY in "deadline", never inside "task". Relative deadlines count and are copied
   exactly as said: "بكرة", "يوم الأحد القادم", "قبل نهاية الأسبوع", "tomorrow", "by Tuesday".
   Example: task "تجهيز العرض التقديمي لشركة النخبة وترتيب اجتماع معهم", deadline "قبل نهاية الأسبوع القادم".
+
+Tasks the speaker (the manager who recorded the meeting) takes on himself are tasks too: "أنا بكلم
+المدير المالي", "أنا بـ…", "عليّ…", "بتابع أنا…", "I'll…", "I will…", "leave it with me". Their owner
+is exactly "المدير" (or "Manager" in an English meeting); never drop them.
 
 Rules: never invent tasks, owners, deadlines or decisions. Only include what was actually said.
 If you are not sure who owns a task, leave owner empty and list the candidates instead of guessing.
@@ -196,6 +202,15 @@ _TASK_KEYS = {
     "deadline": ("deadline", "due", "due_date", "date", "when", "timeline", "by",
                  "الموعد", "الموعد_النهائي", "التاريخ", "موعد"),
 }
+
+
+# The manager's own tasks: owner "المدير" / "Manager" (and the speaker's "أنا" / "I" / "me", which a
+# model sometimes writes instead). Shown as "(you)" and never sent to anyone.
+_MANAGER_KEYS = frozenset({"المدير", "مدير", "المدير العام", "manager", "the manager", "أنا", "انا", "me", "i", "myself"})
+
+
+def is_manager(name: str) -> bool:
+    return name_key(name) in {name_key(k) for k in _MANAGER_KEYS}
 
 
 def split_owners(person: str) -> List[str]:
@@ -394,7 +409,7 @@ def normalize(parsed: Dict[str, Any], fallback_language: str = "en") -> Tuple[st
         cands = clean_list(_pick(raw, _TASK_KEYS["candidates"])) if isinstance(raw, dict) else []
         # Several owners named for one task are joint owners (it goes to each); candidates are the
         # model saying it is unclear WHO, and that is never guessed.
-        person = "، ".join(dict.fromkeys(canon(o) for o in owners))
+        person = "، ".join(dict.fromkeys(LABELS[language]["manager"] if is_manager(o) else canon(o) for o in owners))
         candidates = [] if person else list(dict.fromkeys(canon(c) for c in cands))
         # No contact is taken from the meeting: people are reached only as members who joined via
         # /invite, linked by name (contacts.py); any email/phone the model returns is ignored.
@@ -564,7 +579,11 @@ async def _fill_gaps(llm: Any, transcript: str, language: str, brief: Dict[str, 
 
 def owner_text(task: Dict[str, Any], lang: str, question: bool = True) -> str:
     if task["person"]:
-        return task["person"]
+        names = split_owners(task["person"])
+        if not any(is_manager(n) for n in names):
+            return task["person"]
+        me = f"{LABELS[lang]['manager']} ({LABELS[lang]['you']})"
+        return "، ".join(me if is_manager(n) else n for n in names)
     labels = LABELS[lang]
     cands = task.get("candidates") or []
     if not cands:

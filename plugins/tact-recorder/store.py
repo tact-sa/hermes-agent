@@ -207,8 +207,7 @@ def mark_sent(meeting_id: int, position: int, channels: List[str]) -> None:
 
 
 def update_task(meeting_id: int, position: int, **fields: Any) -> None:
-    fields["status"] = "pending"
-    fields["confirmed_at"] = None
+    """Edit a task's fields; its status stays as it is (a confirmed task edited stays confirmed)."""
     cols = ", ".join(f"{k} = ?" for k in fields)
     with connect() as con:
         con.execute(f"UPDATE tasks SET {cols} WHERE meeting_id = ? AND position = ?",

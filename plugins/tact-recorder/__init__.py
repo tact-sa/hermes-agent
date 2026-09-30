@@ -77,7 +77,7 @@ _RUNNING: set = set()  # background jobs (kept referenced until done)
 _awaiting_edit: Dict[Tuple[str, str], Tuple[int, int, str, float]] = {}
 # (platform, chat_id) -> expiry after a bare /minutes: the next audio/voice is a recording
 _minutes_armed: Dict[Tuple[str, str], float] = {}
-_BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntdk]))?$")
+_BUTTON_RE = re.compile(r"^rec:([acerfbu]):(\d+):(\d+)(?::([ntdk]))?$")
 # rec:x:<p|s|c>:<meeting> sending, rec:s:<y|n>:<meeting>:<task> save contact, rec:j:<a|o|r>:<request>[:<i>] join
 # rec:d:<y|n>:<meeting, 0 = all> delete recordings; rec:w:a:<meeting>:<task>:<contact> which person a
 # shared first name means; rec:p:<e|f|r|k|d|n>:<contact> edit / delete a contact
@@ -93,7 +93,7 @@ _person_actions: Dict[Tuple[str, str], Tuple[str, float]] = {}
 _awaiting_person: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
 _PERSON_FIELDS = {"f": ("full_name", "الاسم الكامل"), "r": ("role", "الوظيفة / القسم")}
 _DELETE_RE = re.compile(r"^(?:delete|remove|حذف)\s+#?(\d+)(\s+confirm)?$|^(clear)(\s+confirm)?$", re.IGNORECASE)
-_BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back"}
+_BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back", "u": "undo"}
 _BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline", "k": "contact"}
 _INVITE_RE = re.compile(r"^(?:revoke|cancel|إلغاء|الغاء)?$", re.IGNORECASE)
 _RETRY_RE = re.compile(r"^#?(\d+)\s+retry$", re.IGNORECASE)
@@ -275,8 +275,8 @@ def _text_replies(platform: str, chat_id: str, text: str) -> Optional[confirm.Ou
     if command is None:
         return None
     meeting = store.latest_pending(platform, chat_id)
-    if meeting is None and command[0] == "edit":
-        meeting = store.latest_briefed(platform, chat_id)  # contacts can still be set after confirmation
+    if meeting is None and command[0] in ("edit", "undo"):
+        meeting = store.latest_briefed(platform, chat_id)  # a confirmed meeting can still be corrected
     if meeting is None:
         return None
     return confirm.apply(meeting, *command)
@@ -379,9 +379,11 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
     meeting = store.get_meeting(meeting_id, platform, chat_id)
     if meeting is None or meeting["user_id"] != user_id:
         return None, "Not allowed."
-    if action in ("edit", "field", "back") and meeting["status"] == "pending":
+    if action in ("edit", "field", "back"):  # at any time: a confirmed task can still be corrected
         if action == "edit":  # the card offers Name / Task / Deadline / Back
-            return confirm.Outcome(meeting_id, changed=[position], picker=position), ""
+            lang = fmt.lang_of(meeting["language"])
+            warning = [confirm.SENT_WARNING[lang]] if confirm.was_sent(meeting_id, position) else []
+            return confirm.Outcome(meeting_id, messages=warning, changed=[position], picker=position), ""
         if action == "back":  # normal buttons again
             _awaiting_edit.pop((platform, chat_id), None)
             return confirm.Outcome(meeting_id, changed=[position]), ""
@@ -392,8 +394,6 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
                                                time.monotonic() + EDIT_TTL_SECONDS)
         lang = fmt.lang_of(meeting["language"])
         return confirm.Outcome(meeting_id, messages=[confirm.FIELD_PROMPT[lang][field_name].format(n=position)]), ""
-    if action in ("field", "back"):
-        action = "edit"  # meeting no longer pending: apply() says so
     return confirm.apply(meeting, action, position), ""
 
 
@@ -594,6 +594,13 @@ async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: st
         return ""
     if action == "c":
         await present._edit(bot, chat_id, message_id, sending.cancelled_text(lang), None)
+        return ""
+    if action == "r":  # [📤 re-send] after editing a sent task: this task only, to its own member(s)
+        plan = sending.plan(number, [extra])
+        await present._edit(bot, chat_id, message_id, "📤 …", None)
+        report, sent = await sending.execute(bot, meeting, lang, plan)
+        await present.refresh_cards(adapter, "telegram", chat_id, number, sent)
+        await _send(adapter, chat_id, report)
         return ""
     # action == "s": the manager's explicit ✅ under the preview
     await present._edit(bot, chat_id, message_id, "📤 …", None)  # no second tap on the same preview

@@ -1,0 +1,6 @@
+name: tact-clock
+version: "0.1.0"
+description: "Gives the model the real current date and time (configured timezone, Asia/Riyadh for Tact) on every turn, as a short line appended to that turn's message, so 'what time is it' and relative dates ('tomorrow', 'in 2 hours') never rely on a guess or on the session's start date."
+author: "Tact"
+provides_hooks:
+  - pre_llm_call

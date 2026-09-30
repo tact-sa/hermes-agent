@@ -32,7 +32,9 @@ SMTP_VARS = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM"
 
 TEXT = {
     "ar": {"channel_telegram": "تيليجرام", "channel_email": "البريد الإلكتروني",
-           "unclear": "المسؤول غير واضح", "not_joined": "⏳ لم ينضم بعد",
+           "unclear": "المسؤول غير واضح", "not_joined": "⏳ لم ينضم بعد", "self": "مهمتك — لا تُرسل",
+           "resent": "📤 أُعيد إرسال المهمة {n} إلى {who}.", "resend_ask": "📤 إعادة إرسال المهمة {n} بعد التعديل؟",
+           "btn_resend": "📤 إعادة إرسال لهذا الشخص",
            "ambiguous": "❓ أكثر من شخص بهذا الاسم: {choices} — اختر من الأزرار",
            "preview": "📤 معاينة الإرسال — اجتماع {id}", "skipped": "⏭️ لن تُرسل:",
            "resend": "⚠️ {n} من هذه المهام أُرسلت من قبل وسيُعاد إرسالها إذا ضغطت ✅.",
@@ -45,7 +47,9 @@ TEXT = {
            "ask": "إرسال كل مهمة مؤكدة إلى صاحبها؟ ستظهر معاينة أولاً.", "btn": "📤 إرسال المهام",
            "btn_send": "✅ إرسال", "btn_cancel": "❌ إلغاء"},
     "en": {"channel_telegram": "Telegram", "channel_email": "email",
-           "unclear": "owner unclear", "not_joined": "⏳ not joined yet",
+           "unclear": "owner unclear", "not_joined": "⏳ not joined yet", "self": "your task — not sent",
+           "resent": "📤 Task {n} was sent again to {who}.", "resend_ask": "📤 Send task {n} again after the edit?",
+           "btn_resend": "📤 Send again to this person",
            "ambiguous": "❓ more than one person with this name: {choices} — choose with the buttons",
            "preview": "📤 Sending preview — Meeting {id}", "skipped": "⏭️ Will not be sent:",
            "resend": "⚠️ {n} of these tasks were sent before and will be sent again if you tap ✅.",
@@ -70,18 +74,23 @@ def email_ready() -> bool:
     return all(_secret(name) for name in SMTP_VARS)
 
 
-def plan(meeting_id: int) -> Dict[str, Any]:
-    """Who gets which confirmed tasks and how; which tasks are skipped and why. Sends nothing."""
+def plan(meeting_id: int, positions: Optional[List[int]] = None) -> Dict[str, Any]:
+    """Who gets which confirmed tasks and how; which tasks are skipped and why (only *positions*,
+    when given). Sends nothing. The manager's own tasks are never sent."""
     recipients: Dict[Tuple[str, str], Dict[str, Any]] = {}
     skipped: List[Tuple[Dict[str, Any], str, str]] = []
     choices: List[Tuple[Dict[str, Any], tuple]] = []
-    tasks = [t for t in store.tasks_for(meeting_id) if t["status"] == "confirmed"]
+    tasks = [t for t in store.tasks_for(meeting_id) if t["status"] == "confirmed"
+             and (positions is None or t["position"] in positions)]
     for task in tasks:
         names = fmt.split_owners(task["person"])
         if not names:
             skipped.append((task, "", "unclear"))
             continue
         for name in names:
+            if fmt.is_manager(name):
+                skipped.append((task, name, "self"))
+                continue
             # The task's own contact belongs to its single owner; joint owners use the book.
             single = len(names) == 1
             route = contacts.route(name, task.get("contact_id") if single else None)
@@ -198,7 +207,17 @@ def markup(kind: str, meeting_id: int, lang: str, p: Optional[Dict[str, Any]] = 
 
 
 def has_sendable(meeting_id: int) -> bool:
-    return any(t["status"] == "confirmed" and t["person"] for t in store.tasks_for(meeting_id))
+    return any(t["status"] == "confirmed" and any(not fmt.is_manager(n) for n in fmt.split_owners(t["person"]))
+               for t in store.tasks_for(meeting_id))
+
+
+def resend_markup(meeting_id: int, position: int, lang: str) -> Any:
+    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[Button(TEXT[lang]["btn_resend"], callback_data=f"rec:x:r:{meeting_id}:{position}")]])
+
+
+def resend_ask_text(position: int, lang: str) -> str:
+    return TEXT[lang]["resend_ask"].format(n=position)
 
 
 def cancelled_text(lang: str) -> str:

@@ -72,7 +72,7 @@ def picker_names(platform: str, chat_id: str, limit: int = 12) -> List[str]:
     unique: Dict[str, str] = {}
     for name in names:
         key = fmt.name_key(name)
-        if is_person_name(name) and key not in hidden:
+        if is_person_name(name) and key not in hidden and not fmt.is_manager(name):
             unique.setdefault(key, fmt.clean(name))
     return list(unique.values())[:limit]
 
@@ -286,6 +286,9 @@ def display(task: Dict[str, Any], lang: str) -> str:
     chosen = by_id(task["contact_id"]) if len(names) == 1 and task.get("contact_id") else None
     parts = []
     for name in names:
+        if fmt.is_manager(name):  # the manager's own task: nobody to reach
+            parts.append(f"{name}: {labels['self_task']}" if len(names) > 1 else labels["self_task"])
+            continue
         found = [chosen] if is_member(chosen) else members_for(name)
         if len(found) > 1:  # shared first name: the manager chooses in the send preview
             text = "❓ " + " / ".join(label(r) for r in found)
@@ -310,7 +313,7 @@ def not_joined(platform: str, chat_id: str) -> List[str]:
     unique: Dict[str, str] = {}
     for name in names:
         key = fmt.name_key(name)
-        if is_person_name(name) and key not in hidden and not members_for(name):
+        if is_person_name(name) and key not in hidden and not members_for(name) and not fmt.is_manager(name):
             unique.setdefault(key, fmt.clean(name))
     return list(unique.values())
 

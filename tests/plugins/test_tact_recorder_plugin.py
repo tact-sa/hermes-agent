@@ -436,14 +436,18 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
     assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."]
     press(f"rec:c:{meeting_id}:1", card1)
     assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 Contact: ⏳ not joined yet — send /invite"
-                                   "\n\n✅ Confirmed", None)
+                                   "\n\n✅ Confirmed", bot.messages[card1][1])
+    # A confirmed card keeps ✏️ and ↩️ so a mistaken confirmation can be corrected.
+    assert _buttons(bot.messages[card1][1]) == [[("✏️ Edit", f"rec:e:{meeting_id}:1"), ("↩️ Undo", f"rec:u:{meeting_id}:1")]]
     reply("إلغاء 3")  # a text reply edits that task's card, like its button would
-    assert bot.messages[card3][0].endswith("\n\n❌ Cancelled") and bot.messages[card3][1] is None
+    assert bot.messages[card3][0].endswith("\n\n❌ Cancelled")
+    assert _buttons(bot.messages[card3][1]) == [[("↩️ Undo", f"rec:u:{meeting_id}:3")]]  # can be restored
     assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (1)", f"rec:a:{meeting_id}:0")]]
 
     gw.adapter.sent.clear()
     press(f"rec:a:{meeting_id}:0", all_id)
-    assert bot.messages[card2][0].endswith("✅ Confirmed") and bot.messages[card2][1] is None
+    assert bot.messages[card2][0].endswith("✅ Confirmed")
+    assert _buttons(bot.messages[card2][1]) == [[("✏️ Edit", f"rec:e:{meeting_id}:2"), ("↩️ Undo", f"rec:u:{meeting_id}:2")]]
     assert bot.messages[all_id] == ("✅ All tasks handled.", None)
     (final,) = gw.adapter.sent
     assert final.startswith(f"✅ Confirmed tasks — Meeting {meeting_id}\n\n1.\n👤 Name: Ahmad\n")
@@ -1260,3 +1264,96 @@ def test_invite_edge_cases_self_invite_expiry_reopen_and_restart(recorder, teleg
     mod.invite.awaiting_detail.clear()
     _press(mod, gw.adapter, "rec:j:k:2:0", max(bot.messages))  # [تخطي] carries its question
     assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (Ahmad)"
+
+
+def test_the_managers_own_tasks_are_shown_as_his_and_never_sent(recorder, telegram_stub):
+    mod = recorder
+    llm = ScriptedLlm(meeting_brief={"language": "ar", "summary": ["x"], "decisions": ["d"], "tasks": [
+        {"owner": "المدير", "task": "مكالمة المدير المالي بخصوص الميزانية", "deadline": "يوم الخميس"},
+        {"owner": "أنا", "task": "مراجعة العقد", "deadline": ""},
+        {"owner": ["أنا", "خالد"], "task": "زيارة العميل", "deadline": "الأحد"},
+        {"owner": "خالد", "task": "تجهيز العرض", "deadline": "بكرة"}]})
+    lang, brief, tasks = asyncio.run(mod.brief.analyze(llm, "وأنا بكلم المدير المالي بخصوص الميزانية يوم الخميس"))
+    assert [t["person"] for t in tasks] == ["المدير", "المدير", "المدير، خالد", "خالد"]  # none dropped
+    mod.contacts.link_telegram("خالد", "901", "khalid_k")
+    rows = mod.contacts.annotate([dict(t, position=i, status="pending") for i, t in enumerate(tasks, 1)], lang)
+    card = mod.brief.task_card(rows[0], 4, lang)
+    assert "\n👤 المدير (أنت)\n" in card and card.endswith("📞 التواصل: — مهمتك")
+    assert "👤 المدير (أنت)، خالد" in mod.brief.task_card(rows[2], 4, lang)
+    assert mod.brief.contact_text(rows[2], lang) == "المدير: — مهمتك، خالد: ✅ @khalid_k (مسجل)"
+
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, lang, brief, tasks)
+    mod.store.set_task_status(meeting_id, [1, 2, 3, 4], "confirmed")
+    plan = mod.sending.plan(meeting_id)
+    assert [(r["name"], [t["position"] for t in r["tasks"]]) for r in plan["recipients"]] == [
+        ("خالد", [3, 4])]  # the joint task still reaches خالد; the manager's part goes nowhere
+    assert [(t["position"], reason) for t, _, reason in plan["skipped"]] == [(1, "self"), (2, "self"), (3, "self")]
+    assert "المدير" not in mod.contacts.not_joined("telegram", CHAT)
+    assert "المدير" not in mod.contacts.picker_names("telegram", CHAT)
+
+
+def test_a_confirmed_task_can_be_undone_edited_and_sent_again(recorder, telegram_stub):
+    mod = recorder
+    meeting_id = _seed(mod)
+    mod.contacts.link_telegram("Ahmad", "801", "ahmad_k")
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    assert _dispatch(mod, gw, _event(text=f"/brief {meeting_id}", message_type="TEXT")) is None
+    card1, card2, card3, all_id = [i for i, (t, _) in bot.messages.items()
+                                   if t.startswith("📋 Task") or t.startswith("Confirm all")]
+
+    def reply(text):
+        gw.adapter.sent.clear()
+        assert _dispatch(mod, gw, _event(text=text, message_type="TEXT")) is None, text
+        return gw.adapter.sent
+
+    def status():
+        return [t["status"] for t in mod.store.tasks_for(meeting_id)], \
+            mod.store.get_meeting(meeting_id, "telegram", CHAT)["status"]
+
+    gw.adapter.sent.clear()
+    _press(mod, gw.adapter, f"rec:a:{meeting_id}:0", all_id)
+    assert gw.adapter.sent[-1].startswith("✅ Confirmed tasks") and status() == (["confirmed"] * 3, "confirmed")
+
+    # ↩️ on a confirmed card: back to pending, the meeting reopens, "Confirm all" counts it again.
+    _press(mod, gw.adapter, f"rec:u:{meeting_id}:2", card2)
+    assert status() == (["confirmed", "pending", "confirmed"], "pending")
+    assert _buttons(bot.messages[card2][1])[0][0] == ("✅ Confirm", f"rec:c:{meeting_id}:2")
+    assert _buttons(bot.messages[all_id][1]) == [[("✅ Confirm all (1)", f"rec:a:{meeting_id}:0")]]
+    gw.adapter.sent.clear()
+    _press(mod, gw.adapter, f"rec:c:{meeting_id}:2", card2)
+    assert status() == (["confirmed"] * 3, "confirmed")
+    assert gw.adapter.sent[-1].startswith("✅ Confirmed tasks")  # the final summary is sent again
+
+    # Text replies too: "تراجع 3" on the confirmed meeting; a cancelled task can be restored.
+    reply("تراجع 3")
+    assert status() == (["confirmed", "confirmed", "pending"], "pending")
+    reply("إلغاء 3")
+    assert _buttons(bot.messages[card3][1]) == [[("↩️ Undo", f"rec:u:{meeting_id}:3")]]
+    _press(mod, gw.adapter, f"rec:u:{meeting_id}:3", card3)
+    reply("confirm 3")
+    assert status() == (["confirmed"] * 3, "confirmed")
+
+    # ✏️ on a confirmed task edits it and it stays confirmed.
+    _press(mod, gw.adapter, f"rec:e:{meeting_id}:2", card2)
+    _press(mod, gw.adapter, f"rec:f:{meeting_id}:2:d", card2)
+    reply("Monday")
+    assert mod.store.tasks_for(meeting_id)[1]["deadline"] == "Monday" and status()[0][1] == "confirmed"
+
+    # Once sent, ✏️ warns, and after the edit offers to send this task again (never on its own).
+    _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", 1)
+    _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
+    assert len(bot.sent_to("801")) == 1
+    gw.adapter.sent.clear()
+    _press(mod, gw.adapter, f"rec:e:{meeting_id}:1", card1)
+    assert gw.adapter.sent == ["⚠️ This task was already sent — the edit will not be sent automatically"]
+    _press(mod, gw.adapter, f"rec:f:{meeting_id}:1:d", card1)
+    reply("Thursday")
+    offer = max(bot.messages)
+    assert bot.messages[offer][0] == "📤 Send task 1 again after the edit?"
+    assert _buttons(bot.messages[offer][1]) == [[("📤 Send again to this person", f"rec:x:r:{meeting_id}:1")]]
+    assert len(bot.sent_to("801")) == 1  # nothing re-sent yet
+    _press(mod, gw.adapter, f"rec:x:r:{meeting_id}:1", offer)
+    assert bot.sent_to("801")[-1].endswith("1. Send the Q3 budget — Deadline: Thursday")
+    assert len(bot.sent_to("801")) == 2
