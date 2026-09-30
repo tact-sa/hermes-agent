@@ -192,13 +192,6 @@ def set_task_message(meeting_id: int, position: int, message_id: Any) -> None:
                     (str(message_id), meeting_id, position))
 
 
-def set_task_contact(meeting_id: int, position: int, contact: str) -> None:
-    """A contact is not part of what the manager confirms, so setting one keeps the task's status."""
-    with connect() as con:
-        con.execute("UPDATE tasks SET contact = ? WHERE meeting_id = ? AND position = ?",
-                    (contact, meeting_id, position))
-
-
 def set_task_contact_id(meeting_id: int, position: int, contact_id: int) -> None:
     """The manager's choice of which contact a shared first name means for this task."""
     with connect() as con:

@@ -23,8 +23,8 @@ on Telegram one message per task with its own buttons (``rec:`` callbacks, scope
 button flows keep working), edited in place as tasks are handled; otherwise one list and text replies.
 Nothing goes to anyone but the manager until the manager, after confirming, taps [📤 Send tasks]
 and then ✅ under the preview (``sending.py``): each person then gets only their own confirmed
-tasks, by Telegram (people join through a manager-approved ``/invite`` link, ``invite.py``) or by
-email. How each person is reached lives in the contacts book (``contacts.py``, ``/contacts``).
+tasks on Telegram. Only members who joined through a manager-approved ``/invite`` link
+(``invite.py``) can be reached; a task reaches its owner's member (``contacts.py``, ``/team``).
 
 The brief is retried once inside ``brief.analyze`` when the model returns no usable JSON; if it
 still fails the transcript stays saved and ``/brief <id> retry`` writes the brief again from it
@@ -81,7 +81,9 @@ _BUTTON_RE = re.compile(r"^rec:([acerfb]):(\d+):(\d+)(?::([ntdk]))?$")
 # rec:x:<p|s|c>:<meeting> sending, rec:s:<y|n>:<meeting>:<task> save contact, rec:j:<a|o|r>:<request>[:<i>] join
 # rec:d:<y|n>:<meeting, 0 = all> delete recordings; rec:w:a:<meeting>:<task>:<contact> which person a
 # shared first name means; rec:p:<e|f|r|k|d|n>:<contact> edit / delete a contact
-_EXTRA_RE = re.compile(r"^rec:([xsjdwp]):([a-z]):(\d+)(?::(\d+))?(?::(\d+))?$")
+# rec:m:<a|b>:<meeting>:<task>[:<member>] link a task to a registered member; rec:s:<y|n>:<meeting>:<task>
+# keep the task's owner name as that member's alias
+_EXTRA_RE = re.compile(r"^rec:([xsjdwpm]):([a-z]):(\d+)(?::(\d+))?(?::(\d+))?$")
 _CONTACTS_RE = re.compile(r"^(edit|تعديل|delete|remove|حذف|احذف)\s+(.+?)$", re.IGNORECASE)
 PERSON_ACTION_TTL = 15 * 60
 # (chat_id, contact id) -> (manager user id, expiry): contact buttons shown to that manager, so a
@@ -89,7 +91,7 @@ PERSON_ACTION_TTL = 15 * 60
 _person_actions: Dict[Tuple[str, str], Tuple[str, float]] = {}
 # (platform, chat_id) -> (contact id, field, expiry) after a contact field button
 _awaiting_person: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
-_PERSON_FIELDS = {"f": ("full_name", "الاسم الكامل"), "r": ("role", "الوظيفة / القسم"), "k": ("contact", "وسيلة التواصل")}
+_PERSON_FIELDS = {"f": ("full_name", "الاسم الكامل"), "r": ("role", "الوظيفة / القسم")}
 _DELETE_RE = re.compile(r"^(?:delete|remove|حذف)\s+#?(\d+)(\s+confirm)?$|^(clear)(\s+confirm)?$", re.IGNORECASE)
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back"}
 _BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline", "k": "contact"}
@@ -384,6 +386,8 @@ def handle_button(data: str, platform: str, chat_id: str, user_id: str) -> Tuple
             _awaiting_edit.pop((platform, chat_id), None)
             return confirm.Outcome(meeting_id, changed=[position]), ""
         field_name = _BUTTON_FIELDS[m.group(4) or "n"]
+        if field_name == "contact":  # no typed contacts: the registered members are offered instead
+            return confirm.Outcome(meeting_id, changed=[position], member_picker=position), ""
         _awaiting_edit[(platform, chat_id)] = (meeting_id, position, field_name,
                                                time.monotonic() + EDIT_TTL_SECONDS)
         lang = fmt.lang_of(meeting["language"])
@@ -435,8 +439,7 @@ def _person_markup(row: Dict[str, Any]) -> Any:
     from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
     return InlineKeyboardMarkup([
         [Button("👤 الاسم الكامل", callback_data=f"rec:p:f:{row['id']}"),
-         Button("💼 الوظيفة", callback_data=f"rec:p:r:{row['id']}")],
-        [Button("📞 التواصل", callback_data=f"rec:p:k:{row['id']}")]])
+         Button("💼 الوظيفة", callback_data=f"rec:p:r:{row['id']}")]])
 
 
 async def _contacts_action(adapter: Any, source: Any, verb: str, name: str) -> None:
@@ -482,8 +485,7 @@ async def _person_button(adapter: Any, action: str, contact_id: int, chat_id: st
     elif action in _PERSON_FIELDS:
         field, title = _PERSON_FIELDS[action]
         _awaiting_person[("telegram", str(chat_id))] = (str(contact_id), field, time.monotonic() + EDIT_TTL_SECONDS)
-        hint = " (بريد إلكتروني أو @username أو رقم هاتف)" if field == "contact" else ""
-        await _send(adapter, chat_id, f"أرسل {title} لـ {row['name']}{hint}")
+        await _send(adapter, chat_id, f"أرسل {title} لـ {row['name']}")
     elif action == "d":
         contacts.delete(row["name"])
         for key in [k for k in _person_actions if k[1] == str(contact_id)]:
@@ -502,12 +504,7 @@ async def _take_person_value(adapter: Any, key: Tuple[str, str], user_id: str, t
     row = contacts.by_id(waiting[0])
     if row is None:
         return "لم تعد جهة الاتصال موجودة."
-    if waiting[1] == "contact":
-        if not contacts.save_contact(row["name"], text):
-            _awaiting_person[key] = waiting
-            return confirm.BAD_CONTACT["ar"]
-    else:
-        contacts.set_details(row["name"], **{waiting[1]: text})
+    contacts.set_details(row["name"], **{waiting[1]: text})
     row = contacts.by_id(waiting[0])
     await adapter._bot.send_message(chat_id=present._chat_arg(key[1]), text="✅ حُفظ.\n" + contacts.edit_text(row),
                                     reply_markup=_person_markup(row))
@@ -550,16 +547,35 @@ async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: st
     if meeting is None:
         return "Not allowed."
     lang = fmt.lang_of(meeting["language"])
-    if kind == "s":
-        task = next((t for t in store.tasks_for(number) if t["position"] == extra), None)
-        if task is None or not task["contact"]:
+    task = next((t for t in store.tasks_for(number) if t["position"] == extra), None) if extra else None
+    if kind == "m":  # link the task to a registered member picked from /team
+        if task is None:
+            return "✔️"
+        if action == "b":
+            await present._edit(bot, chat_id, message_id, "لم يتغير شيء." if lang == "ar" else "Nothing changed.", None)
+            return ""
+        member = contacts.by_id(m.group(5) or 0)
+        if not contacts.is_member(member):
+            return "✔️"
+        store.set_task_contact_id(number, extra, member["id"])
+        await present._edit(bot, chat_id, message_id,
+                            (f"✅ رُبطت المهمة {extra} بـ {contacts.label(member)}." if lang == "ar"
+                             else f"✅ Task {extra} is linked to {contacts.label(member)}."), None)
+        await present.refresh_cards(adapter, "telegram", chat_id, number, [extra])
+        owner = task["person"]
+        if len(fmt.split_owners(owner)) == 1 and not contacts.knows(member, owner):
+            await present.ask_save_alias(bot, chat_id, number, extra, owner, member, lang)
+        return ""
+    if kind == "s":  # keep the owner's name as an alias of the member linked to the task
+        member = contacts.by_id(task["contact_id"]) if task and task["contact_id"] else None
+        if member is None:
             return "✔️"
         if action == "y":
-            contacts.save_contact(task["person"], task["contact"])
-            text = (f"✅ حُفظت وسيلة التواصل لـ {task['person']}." if lang == "ar"
-                    else f"✅ Contact saved for {task['person']}.")
+            contacts.add_alias(member["id"], task["person"])
+            text = (f"✅ «{task['person']}» محفوظ كاسم آخر لـ {contacts.label(member)}." if lang == "ar"
+                    else f"✅ “{task['person']}” saved for {contacts.label(member)}.")
         else:
-            text = "لم تُحفظ." if lang == "ar" else "Not saved."
+            text = "لم يُحفظ." if lang == "ar" else "Not saved."
         await present._edit(bot, chat_id, message_id, text, None)
         return ""
     if action == "p":  # preview only: nothing is sent from here
@@ -661,7 +677,7 @@ def _cmd_contacts(raw_args: str) -> str:
         if contacts.exact(name) is not None and not m.group(2):  # a book entry: confirm first
             return f"للتأكيد أرسل: /contacts delete {name} confirm"
         return f"🗑️ حُذف {name}." if contacts.delete(name) else f"لا توجد جهة اتصال باسم {name}."
-    return contacts.list_text()
+    return contacts.list_text(*_chat())
 
 
 def _cmd_minutes(_raw_args: str) -> str:

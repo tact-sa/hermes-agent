@@ -1,16 +1,16 @@
 """Sending each confirmed task to the person it is assigned to — only after the manager's ✅.
 
 After a meeting is confirmed the manager gets [📤 Send tasks]. That shows a preview (``plan``):
-per person, the channel (Telegram / email) and the tasks; and which tasks will be skipped and why
-(unclear owner, contact unknown, not registered in the bot, email not configured, phone). Only the
-[✅ Send] under that preview sends. Each person gets one message with only their own confirmed
-tasks; a task with joint owners goes to each of them; unclear and cancelled tasks never go out.
-Sent tasks get ``sent_at`` / ``sent_via``; nothing is ever re-sent on its own, and a second
-[📤] warns that those tasks were already sent before offering ✅ again.
+per registered member the tasks they will get on Telegram, and every other task with why it is
+skipped (unclear owner, "⏳ not joined yet", or a name that fits several members, which the manager
+resolves with the preview's buttons). Only the [✅ Send] under that preview sends. Each member gets
+one message with only their own confirmed tasks; a task with joint owners goes to each of them;
+unclear and cancelled tasks never go out. Sent tasks get ``sent_at`` / ``sent_via``; nothing is
+ever re-sent on its own, and a second [📤] warns that those tasks were already sent.
 
-Email goes over SMTP with STARTTLS when SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD and SMTP_FROM
-are all set (read through the profile's secret scope); otherwise email contacts are skipped as
-"email sending not configured". Message contents, addresses' passwords and tokens are never logged.
+People are reached only as members who joined through /invite (``contacts.py``). The SMTP email
+path below (``email_ready`` / ``_send_email``) is kept dormant: no route produces an email target
+any more. Message contents, tokens and passwords are never logged.
 """
 
 from __future__ import annotations
@@ -32,14 +32,12 @@ SMTP_VARS = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM"
 
 TEXT = {
     "ar": {"channel_telegram": "تيليجرام", "channel_email": "البريد الإلكتروني",
-           "unclear": "المسؤول غير واضح", "unknown": "وسيلة التواصل غير معروفة",
-           "not_registered": "⏳ لم يسجّل في البوت بعد — أرسل له رابط /invite",
-           "email_off": "إرسال البريد غير مُعدّ", "phone": "لا يمكن مراسلة أرقام الهواتف بعد",
+           "unclear": "المسؤول غير واضح", "not_joined": "⏳ لم ينضم بعد",
            "ambiguous": "❓ أكثر من شخص بهذا الاسم: {choices} — اختر من الأزرار",
            "preview": "📤 معاينة الإرسال — اجتماع {id}", "skipped": "⏭️ لن تُرسل:",
            "resend": "⚠️ {n} من هذه المهام أُرسلت من قبل وسيُعاد إرسالها إذا ضغطت ✅.",
            "nothing": "لا توجد مهام يمكن إرسالها الآن.",
-           "fix_hint": "لتحديد وسيلة تواصل: تعديل <رقم>: التواصل: @username أو بريد إلكتروني",
+           "fix_hint": "أرسل /invite لمن لم ينضم بعد، أو اربط المهمة بعضو: ✏️ ثم 📞 التواصل.",
            "report": "📤 نتيجة الإرسال — اجتماع {id}", "sent_to": "✅ {name} — {channel}: {n} مهام",
            "failed": "⚠️ فشل الإرسال إلى {name} ({channel})", "cancelled": "لم يُرسل شيء.",
            "header": "📋 مهامك من اجتماع {date} مع {manager}:", "line": "{i}. {task} — الموعد: {deadline}",
@@ -47,14 +45,12 @@ TEXT = {
            "ask": "إرسال كل مهمة مؤكدة إلى صاحبها؟ ستظهر معاينة أولاً.", "btn": "📤 إرسال المهام",
            "btn_send": "✅ إرسال", "btn_cancel": "❌ إلغاء"},
     "en": {"channel_telegram": "Telegram", "channel_email": "email",
-           "unclear": "owner unclear", "unknown": "contact unknown",
-           "not_registered": "⏳ not registered in the bot yet — send them an /invite link",
-           "email_off": "email sending not configured", "phone": "phone numbers can't be messaged yet",
+           "unclear": "owner unclear", "not_joined": "⏳ not joined yet",
            "ambiguous": "❓ more than one person with this name: {choices} — choose with the buttons",
            "preview": "📤 Sending preview — Meeting {id}", "skipped": "⏭️ Will not be sent:",
            "resend": "⚠️ {n} of these tasks were sent before and will be sent again if you tap ✅.",
            "nothing": "There are no tasks that can be sent now.",
-           "fix_hint": "To set a contact: edit <number>: contact: @username or an email address",
+           "fix_hint": "Send /invite to anyone who hasn't joined, or link the task to a member: ✏️ then 📞 Contact.",
            "report": "📤 Sending result — Meeting {id}", "sent_to": "✅ {name} — {channel}: {n} task(s)",
            "failed": "⚠️ Sending to {name} ({channel}) failed", "cancelled": "Nothing was sent.",
            "header": "📋 Your tasks from the meeting on {date} with {manager}:",
@@ -76,7 +72,6 @@ def email_ready() -> bool:
 
 def plan(meeting_id: int) -> Dict[str, Any]:
     """Who gets which confirmed tasks and how; which tasks are skipped and why. Sends nothing."""
-    ready = email_ready()
     recipients: Dict[Tuple[str, str], Dict[str, Any]] = {}
     skipped: List[Tuple[Dict[str, Any], str, str]] = []
     choices: List[Tuple[Dict[str, Any], tuple]] = []
@@ -89,8 +84,7 @@ def plan(meeting_id: int) -> Dict[str, Any]:
         for name in names:
             # The task's own contact belongs to its single owner; joint owners use the book.
             single = len(names) == 1
-            route = contacts.route(name, task["contact"] if single else "", ready,
-                                   task.get("contact_id") if single else None)
+            route = contacts.route(name, task.get("contact_id") if single else None)
             if not route.channel:
                 skipped.append((task, route.who or name, route.reason))
                 if route.choices:  # a shared first name: the manager picks, nothing is guessed

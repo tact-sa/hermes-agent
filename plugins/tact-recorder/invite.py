@@ -13,7 +13,10 @@ Only the manager's pick saves the chat id to that person in the contacts book; a
 name is never matched on its own, and a short name already registered to someone else is refused.
 The manager is then asked the person's full name and role (each skippable).
 Invalid, expired or revoked tokens get one fixed reply and nothing else; join attempts are limited
-per Telegram user. Every other message from a non-allowlisted user takes the unchanged gateway
+per Telegram user; the manager's own account is told it does not need to join. A pending request
+lives only as long as its link: after that its buttons answer that it is over. Opening the link
+again while a request is pending re-sends it to the manager. Every button decision is read from the
+database, so buttons keep working after a restart. Every other message from a non-allowlisted user takes the unchanged gateway
 path and is dropped exactly as before: joining grants no access to the agent, tools or commands.
 """
 
@@ -46,6 +49,9 @@ REGISTERED = "✅ تم تسجيلك لاستقبال المهام."
 ALREADY = "✅ أنت مسجّل بالفعل لاستقبال المهام."
 REJECTED = "❌ لم تتم الموافقة على طلبك."
 INVALID = "⛔ الرابط منتهي أو غير صالح. اطلب رابطاً جديداً من المدير."
+MANAGER_SELF = "أنت المدير — هذا الرابط لدعوة أعضاء الفريق، ولا تحتاج إلى الانضمام."
+DECIDED = "هذا الطلب تم التعامل معه أو انتهى"
+DETAIL_FIELDS = ("full_name", "role")
 
 _attempts: Dict[str, Deque[float]] = defaultdict(deque)
 # (platform, manager chat) -> (join request id, expiry) after "➕ اسم آخر"
@@ -187,10 +193,17 @@ async def handle_join(bot: Any, chat_id: str, user_id: str, username: str, displ
         logger.info("tact-recorder: join attempt with an invalid, expired or revoked link")
         await bot.send_message(chat_id=chat_arg(chat_id), text=INVALID)
         return
+    if str(user_id) == invite["creator_user_id"]:
+        await bot.send_message(chat_id=chat_arg(chat_id), text=MANAGER_SELF)
+        return
     if contacts.by_chat_id(chat_id):
         await bot.send_message(chat_id=chat_arg(chat_id), text=ALREADY)
         return
     with _connect() as con:
+        # A pending request lives as long as its link; an older one simply expires.
+        con.execute("UPDATE join_requests SET status = 'expired' WHERE user_id = ? AND status = 'pending'"
+                    " AND invite_id IN (SELECT id FROM invites WHERE revoked = 1 OR expires_at <= ?)",
+                    (str(user_id), _now()))
         pending = con.execute("SELECT id FROM join_requests WHERE user_id = ? AND status = 'pending'",
                               (str(user_id),)).fetchone()
         if pending is None:
@@ -201,8 +214,17 @@ async def handle_join(bot: Any, chat_id: str, user_id: str, username: str, displ
                 (invite["id"], str(chat_id), str(user_id), username or "", display_name or "",
                  json.dumps(options, ensure_ascii=False), _now())).lastrowid
     await bot.send_message(chat_id=chat_arg(chat_id), text=WAITING)
-    if pending is not None:
-        return  # the manager already has this request
+    if pending is not None:  # opened again: the manager gets the request again, the old copy says so
+        request_id = pending["id"]
+        old = get_request(request_id)
+        if old["manager_message_id"]:
+            try:
+                await bot.edit_message_text(chat_id=chat_arg(old["creator_chat_id"]),
+                                            message_id=int(old["manager_message_id"]),
+                                            text="↪️ أُعيد إرسال هذا الطلب أدناه.", reply_markup=None)
+            except Exception as exc:
+                logger.debug("tact-recorder: old join request message not updated: %s", type(exc).__name__)
+        options = json.loads(old["options"] or "[]")
     request = get_request(request_id)
     await _send_profile_photo(bot, invite["creator_chat_id"], user_id)
     msg = await bot.send_message(
@@ -216,13 +238,19 @@ async def handle_join(bot: Any, chat_id: str, user_id: str, username: str, displ
 def get_request(request_id: int) -> Optional[Any]:
     with _connect() as con:
         return con.execute(
-            "SELECT r.*, i.creator_platform, i.creator_chat_id, i.creator_user_id FROM join_requests r"
-            " JOIN invites i ON i.id = r.invite_id WHERE r.id = ?", (request_id,)).fetchone()
+            "SELECT r.*, i.creator_platform, i.creator_chat_id, i.creator_user_id, i.expires_at, i.revoked"
+            " FROM join_requests r JOIN invites i ON i.id = r.invite_id WHERE r.id = ?", (request_id,)).fetchone()
+
+
+def _is_creator(request: Any, chat_id: str, user_id: str) -> bool:
+    return (request is not None and request["creator_user_id"] == str(user_id)
+            and request["creator_chat_id"] == str(chat_id))
 
 
 def _may_decide(request: Any, chat_id: str, user_id: str) -> bool:
-    return (request is not None and request["status"] == "pending"
-            and request["creator_user_id"] == str(user_id) and request["creator_chat_id"] == str(chat_id))
+    """Only the invite's creator, only while the request is pending and its link still valid."""
+    return (_is_creator(request, chat_id, user_id) and request["status"] == "pending"
+            and not request["revoked"] and request["expires_at"] > _now())
 
 
 async def _close(bot: Any, request: Any, status: str, text: str) -> None:
@@ -267,7 +295,7 @@ async def _ask_detail(bot: Any, platform: str, request: Any, field: str) -> None
             await bot.send_message(chat_id=chat_arg(request["creator_chat_id"]),
                                    text=f"{DETAIL_QUESTIONS[current]} ({name})",
                                    reply_markup=InlineKeyboardMarkup([[Button(
-                                       "تخطي", callback_data=f"rec:j:k:{request['id']}")]]))
+                                       "تخطي", callback_data=f"rec:j:k:{request['id']}:{fields.index(current)}")]]))
             return
     awaiting_detail.pop((platform, request["creator_chat_id"]), None)
     await bot.send_message(chat_id=chat_arg(request["creator_chat_id"]),
@@ -285,16 +313,20 @@ async def _next_detail(bot: Any, platform: str, request: Any, answered: str) -> 
 
 async def handle_button(bot: Any, action: str, request_id: int, option: int, chat_id: str, user_id: str,
                         platform: str = "telegram") -> Tuple[List[str], str]:
-    """``(messages to the manager, toast)`` for a ``rec:j:*`` button; only the invite's creator decides."""
+    """``(messages to the manager, toast)`` for a ``rec:j:*`` button; only the invite's creator decides.
+    Everything is read from the database, so buttons keep working after a restart."""
     request = get_request(request_id)
-    if action == "k":  # [تخطي] a detail question after an approval
-        waiting = awaiting_detail.get((platform, str(chat_id)))
-        if request is None or request["creator_user_id"] != str(user_id) or not waiting or waiting[0] != request_id:
-            return [], "✔️"
-        await _next_detail(bot, platform, request, waiting[1])
+    if not _is_creator(request, chat_id, user_id):
+        return [], "Not allowed."
+    if action == "k":  # [تخطي] a detail question after an approval; the field travels in the button
+        if request["status"] != "approved" or not 0 <= option < len(DETAIL_FIELDS):
+            return [], DECIDED
+        await _next_detail(bot, platform, request, DETAIL_FIELDS[option])
         return [], ""
     if not _may_decide(request, chat_id, user_id):
-        return [], "Not allowed." if request is None or request["creator_user_id"] != str(user_id) else "✔️"
+        if request["status"] == "pending":  # its link expired or was revoked
+            await _close(bot, request, "expired", f"⌛ انتهى طلب {_who(request)} مع انتهاء الرابط.")
+        return [], DECIDED
     if action == "a":
         options = json.loads(request["options"] or "[]")
         if not 0 <= option < len(options):

@@ -46,7 +46,8 @@ LABELS = {
            "btn_confirm": "✅ Confirm", "btn_edit": "✏️ Edit", "btn_remove": "❌ Cancel",
            "btn_name": "👤 Name", "btn_task": "📌 Task", "btn_deadline": "📅 Deadline", "btn_back": "↩️ Back",
            "name": "Name", "task": "Task", "deadline": "Deadline", "contact": "Contact", "btn_contact": "📞 Contact",
-           "unknown": "unknown", "not_registered": "⏳ not registered in the bot yet",
+           "registered": "✅ {username} (registered)", "registered_plain": "✅ registered",
+           "not_joined": "⏳ not joined yet — send /invite", "no_owner": "—",
            "sent_telegram": "📤 Sent via Telegram", "sent_email": "📤 Sent by email",
            "confirm_all": "✅ Confirm all ({n})", "all_prompt": "Confirm all remaining tasks at once:",
            "all_done": "✅ All tasks handled.",
@@ -62,7 +63,8 @@ LABELS = {
            "btn_confirm": "✅ تأكيد", "btn_edit": "✏️ تعديل", "btn_remove": "❌ إلغاء",
            "btn_name": "👤 الاسم", "btn_task": "📌 المهمة", "btn_deadline": "📅 الموعد", "btn_back": "↩️ رجوع",
            "name": "الاسم", "task": "المهمة", "deadline": "الموعد", "contact": "التواصل", "btn_contact": "📞 التواصل",
-           "unknown": "غير معروف", "not_registered": "⏳ لم يسجّل في البوت بعد",
+           "registered": "✅ {username} (مسجل)", "registered_plain": "✅ مسجل",
+           "not_joined": "⏳ لم ينضم بعد — أرسل /invite", "no_owner": "—",
            "sent_telegram": "📤 أُرسلت عبر تيليجرام", "sent_email": "📤 أُرسلت بالبريد الإلكتروني",
            "confirm_all": "✅ تأكيد الكل ({n})", "all_prompt": "تأكيد كل المهام المتبقية دفعة واحدة:",
            "all_done": "✅ تم التعامل مع كل المهام.",
@@ -90,9 +92,7 @@ summary, decisions and open_issues are lists of plain strings: one sentence per 
    responsible, all of their names separated by "، "; or "" if it is not clear who;
    "owner_candidates": when the owner is unclear, the people it could be (else []);
    "task": the action only, one short sentence, WITHOUT the deadline;
-   "deadline": the deadline exactly as said, or "" if none was said;
-   "contact": the owner's email address, phone number or @telegram username ONLY if it was said in
-   the meeting, else "" — never invent or guess one}.
+   "deadline": the deadline exactly as said, or "" if none was said}.
   The deadline goes ONLY in "deadline", never inside "task". Relative deadlines count and are copied
   exactly as said: "بكرة", "يوم الأحد القادم", "قبل نهاية الأسبوع", "tomorrow", "by Tuesday".
   Example: task "تجهيز العرض التقديمي لشركة النخبة وترتيب اجتماع معهم", deadline "قبل نهاية الأسبوع القادم".
@@ -116,8 +116,7 @@ SCHEMA = {
             "type": "object",
             "properties": {"owner": {"type": "string"},
                            "owner_candidates": {"type": "array", "items": {"type": "string"}},
-                           "task": {"type": "string"}, "deadline": {"type": "string"},
-                           "contact": {"type": "string"}},
+                           "task": {"type": "string"}, "deadline": {"type": "string"}},
             "required": ["task"]}},
     },
     "required": ["language", "summary", "tasks"],
@@ -196,39 +195,7 @@ _TASK_KEYS = {
     "candidates": ("owner_candidates", "candidates", "possible_owners"),
     "deadline": ("deadline", "due", "due_date", "date", "when", "timeline", "by",
                  "الموعد", "الموعد_النهائي", "التاريخ", "موعد"),
-    "contact": ("contact", "email", "phone", "telegram", "username", "التواصل", "تواصل", "البريد", "الجوال"),
 }
-
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-_USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{4,31})$")
-_PHONE_RE = re.compile(r"^\+?[\d\s\-().]{7,24}$")
-
-
-def classify_contact(value: Any) -> Tuple[str, str]:
-    """``(kind, normalised)`` for an email, a Telegram @username or a phone number; ``("", "")``
-    for anything else. A bare name-like word is only a username when written with "@"."""
-    text = clean(value).strip("<>")
-    if _EMAIL_RE.match(text):
-        return "email", text.lower()
-    if text.startswith("@") and _USERNAME_RE.match(text):
-        return "username", "@" + _USERNAME_RE.match(text).group(1)
-    if _PHONE_RE.match(text) and sum(c.isdigit() for c in text) >= 7:
-        return "phone", text
-    return "", ""
-
-
-def contact_said(contact: str, transcript: str) -> bool:
-    """Whether *contact* actually occurs in the transcript (a model must not invent one)."""
-    kind, value = classify_contact(contact)
-    lowered = (transcript or "").casefold()
-    if kind == "email":
-        return value in lowered
-    if kind == "username":
-        return value[1:].casefold() in lowered
-    if kind == "phone":
-        digits = "".join(c for c in value if c.isdigit())
-        return digits in "".join(c for c in transcript or "" if c.isdigit())
-    return False
 
 
 def split_owners(person: str) -> List[str]:
@@ -429,9 +396,10 @@ def normalize(parsed: Dict[str, Any], fallback_language: str = "en") -> Tuple[st
         # model saying it is unclear WHO, and that is never guessed.
         person = "، ".join(dict.fromkeys(canon(o) for o in owners))
         candidates = [] if person else list(dict.fromkeys(canon(c) for c in cands))
-        contact = " ".join(_leaves(_pick(raw, _TASK_KEYS["contact"]))) if isinstance(raw, dict) else ""
+        # No contact is taken from the meeting: people are reached only as members who joined via
+        # /invite, linked by name (contacts.py); any email/phone the model returns is ignored.
         tasks.append({"person": person, "person_key": name_key(person), "candidates": candidates,
-                      "task": task, "deadline": deadline, "contact": classify_contact(contact)[1]})
+                      "task": task, "deadline": deadline, "contact": ""})
     known = dict(canonical)
     known.update({name_key(n): n for t in tasks for n in [t["person"], *t["candidates"]] if n})
     move_assignments(brief, tasks, known)
@@ -491,11 +459,6 @@ async def analyze(llm: Any, transcript: str, note: str = "",
         if parsed is not None:
             logger.info("tact-recorder: brief shape: %s", _shape(parsed))
             language, brief, tasks = normalize(parsed, guess_language(transcript))
-            invented = [t for t in tasks if t["contact"] and not contact_said(t["contact"], transcript)]
-            for task in invented:
-                task["contact"] = ""
-            if invented:
-                logger.info("tact-recorder: dropped %d contact(s) not said in the meeting", len(invented))
             followed = await _fill_gaps(llm, transcript, language, brief, tasks, route)
             logger.info("tact-recorder: brief counts: decisions=%d open_issues=%d tasks=%d with_deadline=%d"
                         " follow-ups=%s", len(brief["decisions"]), len(brief["open_issues"]), len(tasks),
@@ -618,16 +581,16 @@ def task_card(task: Dict[str, Any], total: int, lang: str) -> str:
             f"👤 {owner_text(task, lang)}\n"
             f"📌 {task['task']}\n"
             f"📅 {task['deadline'] or labels['missing']}\n"
-            f"📞 {contact_text(task, lang)}")
+            f"📞 {labels['contact']}: {contact_text(task, lang)}")
     status = [labels[task["status"]]] if task["status"] in ("confirmed", "removed") else []
     status += sent_lines(task, lang)
     return f"{text}\n\n" + "\n".join(status) if status else text
 
 
 def contact_text(task: Dict[str, Any], lang: str) -> str:
-    """The contact shown for a task: ``contact_display`` (set by ``contacts.annotate`` from the
-    task's own contact and the contacts book), else the raw contact, else unknown."""
-    return task.get("contact_display") or task.get("contact") or LABELS[lang]["unknown"]
+    """The member a task reaches: ``contact_display`` (set by ``contacts.annotate``: registered /
+    not joined yet), else "not joined yet" for an owner and "—" for an unclear one."""
+    return task.get("contact_display") or LABELS[lang]["not_joined" if task.get("person") else "no_owner"]
 
 
 def sent_lines(task: Dict[str, Any], lang: str) -> List[str]:

@@ -217,9 +217,9 @@ def test_short_recording_is_transcribed_briefed_and_sent_to_the_manager_only(rec
         assert header in brief
     assert brief.endswith("\n\n📋 Tasks (3) in the following messages") and "Send the Q3 budget" not in brief
     (card1, m1), (card2, m2), (card3, _), (all_text, all_markup) = gw.adapter._bot.messages.values()
-    assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 unknown"
+    assert card1 == "📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 Contact: ⏳ not joined yet — send /invite"
     assert _buttons(m1) == [[("✅ Confirm", "rec:c:1:1"), ("✏️ Edit", "rec:e:1:1"), ("❌ Cancel", "rec:r:1:1")]]
-    assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED\n📞 unknown"
+    assert card2 == "📋 Task 2 of 3\n👤 ❓ UNCLEAR: Ahmad or Omar?\n📌 Call the vendor\n📅 NOT MENTIONED\n📞 Contact: —"
     assert card3.startswith("📋 Task 3 of 3\n👤 Ahmad")
     assert _buttons(all_markup) == [[("✅ Confirm all (3)", "rec:a:1:0")]] and "confirm 2" in all_text
     assert not any("[#" in text for text, _ in gw.adapter._bot.messages.values())
@@ -290,12 +290,12 @@ def test_unclear_owner_is_flagged_and_spellings_merge_into_one_person(recorder):
         assert f"👤 {unclear}\n📌 Call the vendor\n📅 {missing}" in fmt.task_card(rows[1], 3, language)
         # The final summary: one labelled block per task under its own number; no brackets.
         title, name, task, due, how, unknown = (
-            ("✅ Confirmed tasks — Meeting 1", "Name", "Task", "Deadline", "Contact", "unknown") if lang == "en"
-            else ("✅ المهام المؤكدة — اجتماع 1", "الاسم", "المهمة", "الموعد", "التواصل", "غير معروف"))
+            ("✅ Confirmed tasks — Meeting 1", "Name", "Task", "Deadline", "Contact", "⏳ not joined yet — send /invite") if lang == "en"
+            else ("✅ المهام المؤكدة — اجتماع 1", "الاسم", "المهمة", "الموعد", "التواصل", "⏳ لم ينضم بعد — أرسل /invite"))
         assert fmt.final_text(1, language, rows) == (
             f"{title}\n\n1.\n👤 {name}: {owner}\n📌 {task}: Send the Q3 budget\n📅 {due}: Sunday\n📞 {how}: {unknown}"
             f"\n\n2.\n👤 {name}: {unclear.rstrip('?؟')}\n📌 {task}: Call the vendor\n📅 {due}: {missing}"
-            f"\n📞 {how}: {unknown}"
+            f"\n📞 {how}: —"
             f"\n\n3.\n👤 {name}: {owner}\n📌 {task}: Book the launch venue\n📅 {due}: {missing}\n📞 {how}: {unknown}")
     assert fmt.brief_text(1, "2026-09-30T10:00:00", "ar", brief, 3).endswith("📋 المهام (3) في الرسائل التالية")
 
@@ -333,10 +333,10 @@ def test_text_replies_edit_labelled_fields_and_cancel(recorder, monkeypatch):
     assert cancelled == "❌ Task 2 cancelled."
     assert final == (
         f"✅ Confirmed tasks — Meeting {meeting_id}\n\n"
-        "1.\n👤 Name: Ahmad\n📌 Task: إرسال الميزانية\n📅 Deadline: يوم الخميس\n📞 Contact: unknown\n\n"
+        "1.\n👤 Name: Ahmad\n📌 Task: إرسال الميزانية\n📅 Deadline: يوم الخميس\n📞 Contact: ⏳ not joined yet — send /invite\n\n"
         "❌ Cancelled tasks\n\n"
-        "2.\n👤 Name: Omar\n📌 Task: Call the vendor\n📅 Deadline: Thursday\n📞 Contact: unknown\n\n"
-        "3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue\n📅 Deadline: NOT MENTIONED\n📞 Contact: unknown")
+        "2.\n👤 Name: Omar\n📌 Task: Call the vendor\n📅 Deadline: Thursday\n📞 Contact: ⏳ not joined yet — send /invite\n\n"
+        "3.\n👤 Name: Ahmad\n📌 Task: Book the launch venue\n📅 Deadline: NOT MENTIONED\n📞 Contact: ⏳ not joined yet — send /invite")
     assert [t["status"] for t in store.tasks_for(meeting_id)] == ["confirmed", "removed", "removed"]
     assert store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
     # Nothing pending any more: confirmation words are ordinary messages again.
@@ -424,7 +424,7 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
             {k: before[k] for k in ("person", "task", "deadline") if k != field}
         assert _buttons(bot.messages[card2][1]) == normal
     assert bot.messages[card2][0] == ("📋 Task 2 of 3\n👤 عمر (يحدد لاحقا)\n📌 الاسم: احمد او عمر (يحدد لاحقا)"
-                                      "\n📅 يوم الخميس\n📞 unknown")
+                                      "\n📅 يوم الخميس\n📞 Contact: ⏳ not joined yet — send /invite")
     assert task(2)["candidates"] == []  # the unclear task now belongs to that person
     # ↩️ puts the normal buttons back and nothing is waiting for a value.
     press(f"rec:e:{meeting_id}:2", card2)
@@ -435,7 +435,7 @@ def test_task_cards_are_edited_in_place_by_buttons_and_text_replies(recorder, te
 
     assert press(f"rec:c:{meeting_id}:1", card1, user="99") == ["Not allowed."]
     press(f"rec:c:{meeting_id}:1", card1)
-    assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 unknown"
+    assert bot.messages[card1] == ("📋 Task 1 of 3\n👤 Ahmad\n📌 Send the Q3 budget\n📅 Sunday\n📞 Contact: ⏳ not joined yet — send /invite"
                                    "\n\n✅ Confirmed", None)
     reply("إلغاء 3")  # a text reply edits that task's card, like its button would
     assert bot.messages[card3][0].endswith("\n\n❌ Cancelled") and bot.messages[card3][1] is None
@@ -538,7 +538,7 @@ def test_brief_json_is_recovered_from_code_fences_and_prose(recorder, monkeypatc
     language, brief, tasks = asyncio.run(fmt.analyze(llm, AR_TRANSCRIPT))
     card = fmt.task_card(dict(tasks[0], position=1, status="pending"), 1, language)
     assert language == "ar" and brief["decisions"] == [] and brief["open_issues"] == []
-    assert card == "📋 مهمة 1 من 1\n👤 ❓ غير واضح\n📌 إرسال الميزانية\n📅 غير مذكور\n📞 غير معروف"
+    assert card == "📋 مهمة 1 من 1\n👤 ❓ غير واضح\n📌 إرسال الميزانية\n📅 غير مذكور\n📞 التواصل: —"
 
 
 async def _result(llm, kw, text):
@@ -775,24 +775,27 @@ def _press(mod, adapter, data, message_id, user=MANAGER):
     return toasts
 
 
-def test_contacts_come_from_the_meeting_or_the_book_or_read_unknown(recorder):
+def test_contacts_show_registered_members_or_not_joined(recorder):
     mod = recorder
-    mod.contacts.save_contact("سارة", "sara@tact.sa")
+    mod.contacts.link_telegram("فهد", "801", "fahad_dev")
+    mod.contacts.link_telegram("سارة", "802")  # no Telegram username
     llm = ScriptedLlm(meeting_brief={"language": "ar", "summary": ["x"], "decisions": ["d"], "tasks": [
-        {"owner": "فهد", "task": "إرسال العرض", "deadline": "بكرة", "contact": "fahad@tact.sa"},
-        {"owner": "عمر", "task": "حجز القاعة", "deadline": "بكرة", "contact": "omar@invented.com"},
-        {"owner": "ساره", "task": "مراجعة العقد", "deadline": "بكرة"},
-        {"owner": "خالد", "task": "تجهيز الميزانية", "deadline": "بكرة"}]})
-    transcript = "يا فهد أرسل العرض بكرة على fahad@tact.sa وعمر يحجز القاعة"
-    lang, _, tasks = asyncio.run(mod.brief.analyze(llm, transcript))
-    assert [t["contact"] for t in tasks] == ["fahad@tact.sa", "", "", ""]  # never one the meeting didn't say
+        {"owner": "فهد", "task": "إرسال العرض", "deadline": "بكرة", "contact": "fahad@other.com"},
+        {"owner": "ساره", "task": "مراجعة العقد", "deadline": "بكرة", "email": "sara@x.com"},
+        {"owner": "خالد", "task": "تجهيز الميزانية", "deadline": "بكرة", "phone": "0501234567"},
+        {"owner": "", "owner_candidates": ["فهد", "خالد"], "task": "حجز القاعة", "deadline": "بكرة"}]})
+    lang, _, tasks = asyncio.run(mod.brief.analyze(llm, "يا فهد أرسل العرض بكرة على fahad@other.com"))
+    assert [t["contact"] for t in tasks] == ["", "", "", ""]  # nothing is taken from the meeting
     rows = mod.contacts.annotate([dict(t, position=i, status="pending") for i, t in enumerate(tasks, 1)], lang)
-    assert [mod.brief.contact_text(t, lang) for t in rows] == ["fahad@tact.sa", "غير معروف", "sara@tact.sa", "غير معروف"]
-    assert "📞 sara@tact.sa" in mod.brief.task_card(rows[2], 4, lang)  # the book, matched across spellings
-    assert "📞 التواصل: غير معروف" in mod.brief.task_block(rows[3], lang)
+    assert [mod.brief.contact_text(t, lang) for t in rows] == [
+        "✅ @fahad_dev (مسجل)", "✅ مسجل", "⏳ لم ينضم بعد — أرسل /invite", "—"]
+    assert mod.brief.task_card(rows[0], 4, lang).endswith("\n📞 التواصل: ✅ @fahad_dev (مسجل)")
+    assert "📞 التواصل: ⏳ لم ينضم بعد — أرسل /invite" in mod.brief.task_block(rows[2], lang)
+    en = mod.contacts.annotate([dict(rows[0], contact_display=None), dict(rows[2], contact_display=None)], "en")
+    assert [t["contact_display"] for t in en] == ["✅ @fahad_dev (registered)", "⏳ not joined yet — send /invite"]
 
 
-def test_editing_a_contact_validates_it_and_offers_to_save_it(recorder, telegram_stub):
+def test_contact_is_picked_from_registered_members_and_the_name_kept_as_alias(recorder, telegram_stub):
     mod = recorder
     meeting_id = _seed(mod)
     gw = FakeGateway(bot=True)
@@ -807,24 +810,39 @@ def test_editing_a_contact_validates_it_and_offers_to_save_it(recorder, telegram
 
     _press(mod, gw.adapter, f"rec:e:{meeting_id}:1", card1)
     _press(mod, gw.adapter, f"rec:f:{meeting_id}:1:k", card1)
-    assert gw.adapter.sent[-1] == "Send the contact for task 1: an email address or @username"
-    assert reply("hello there") == ["📞 That is not a contact. Send an email address, a @username or a phone number."]
+    assert gw.adapter.sent[-1] == "No registered members yet — send /invite"
+
+    mod.contacts.link_telegram("أحمد", "801", "ahmad_k")  # joined through /invite as "أحمد"
+    mod.contacts.set_details("أحمد", full_name="أحمد الزهراني", role="مالية")
+    mod.contacts.link_telegram("نورة", "802")
     _press(mod, gw.adapter, f"rec:e:{meeting_id}:1", card1)
     _press(mod, gw.adapter, f"rec:f:{meeting_id}:1:k", card1)
-    reply("@ahmad_k")
-    assert "📞 @ahmad_k (⏳ not registered in the bot yet)" in bot.messages[card1][0]
+    picker = max(bot.messages)
+    assert bot.messages[picker][0] == "📞 Pick the registered member for task 1 (Ahmad):"
+    ahmad = mod.contacts.exact("أحمد")["id"]
+    assert _buttons(bot.messages[picker][1]) == [[("أحمد الزهراني (مالية)", f"rec:m:a:{meeting_id}:1:{ahmad}")],
+                                                 [("نورة", f"rec:m:a:{meeting_id}:1:{mod.contacts.exact('نورة')['id']}")],
+                                                 [("↩️ Back", f"rec:m:b:{meeting_id}:1")]]
+    assert _press(mod, gw.adapter, f"rec:m:a:{meeting_id}:1:{ahmad}", picker, user="99") == ["Not allowed."]
+    _press(mod, gw.adapter, f"rec:m:a:{meeting_id}:1:{ahmad}", picker)
+    assert bot.messages[picker] == ("✅ Task 1 is linked to أحمد الزهراني (مالية).", None)
+    assert "\n📞 Contact: ✅ @ahmad_k (registered)" in bot.messages[card1][0]
     question = max(bot.messages)
-    assert bot.messages[question][0] == "Save this contact for Ahmad for future meetings?"
-    assert mod.contacts.find("Ahmad") is None  # only saved when the manager says so
+    assert bot.messages[question][0] == "Save “Ahmad” as another name for أحمد الزهراني (مالية) in future meetings?"
+    assert mod.contacts.find("Ahmad") is None  # only kept when the manager says so
     _press(mod, gw.adapter, f"rec:s:y:{meeting_id}:1", question)
-    assert mod.contacts.find("Ahmad")["telegram_username"] == "@ahmad_k"
-    assert "phone numbers can't be messaged yet" in reply("edit 2: contact: +966 50 123 4567")[0]
+    assert mod.contacts.find("Ahmad")["id"] == ahmad  # future meetings saying "Ahmad" reach this member
+    assert "✅ @ahmad_k (registered)" in mod.brief.task_card(
+        mod.contacts.annotate(mod.store.tasks_for(meeting_id), "en")[2], 3, "en")  # task 3 is Ahmad's too
 
-    reply("confirm all")
-    reply("edit 1: contact: ahmad@tact.sa")  # contacts can still be set after confirmation
-    task1 = mod.store.tasks_for(meeting_id)[0]
-    assert (task1["contact"], task1["status"]) == ("ahmad@tact.sa", "confirmed")
-    assert mod.store.get_meeting(meeting_id, "telegram", CHAT)["status"] == "confirmed"
+    # A typed contact is refused and the picker is shown instead; ↩️ changes nothing.
+    sent = reply("edit 3: contact: ahmad@tact.sa")
+    assert sent == ["📞 Contacts can't be typed: they come only from members who joined through /invite. Pick one:"]
+    picker = max(bot.messages)
+    assert bot.messages[picker][0].startswith("📞 Pick the registered member for task 3")
+    _press(mod, gw.adapter, f"rec:m:b:{meeting_id}:3", picker)
+    assert bot.messages[picker] == ("Nothing changed.", None)
+    assert mod.store.tasks_for(meeting_id)[2]["contact"] in ("", None)
 
 
 def _invite(mod, gw):
@@ -846,8 +864,8 @@ def _join(mod, adapter, token, user=555, username="fahad", name="Fahad K"):
 def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub):
     mod = recorder
     meeting_id = _seed(mod)
-    mod.store.set_task_status(meeting_id, [1], "confirmed")  # Ahmad, a confirmed owner
-    mod.contacts.save_contact("Omar", "omar@tact.sa")  # the contacts book comes first
+    mod.store.update_task(meeting_id, 2, person="Omar", person_key="omar", candidates="[]")
+    mod.store.set_task_status(meeting_id, [1, 2], "confirmed")  # Ahmad and Omar, confirmed owners
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
     token = _invite(mod, gw)
@@ -862,18 +880,18 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     assert "— عبر رابط أنشأته الساعة " in request_text and request_text.endswith("\nاربطه بـ:")
     request_id = max(bot.messages)
     labels = [b for row in _buttons(bot.messages[request_id][1]) for b, _ in row]
-    assert labels == ["Omar", "Ahmad", "➕ اسم آخر", "❌ رفض"]
+    assert labels == ["Ahmad", "Omar", "➕ اسم آخر", "❌ رفض"]
     assert mod.contacts.by_chat_id("555") is None  # nothing registered before the manager decides
     # Never matched by display name, and nobody but the manager can decide.
-    assert _press(mod, gw.adapter, "rec:j:a:1:0", request_id, user="555") == ["Not allowed."]
-    _press(mod, gw.adapter, "rec:j:a:1:0", request_id)
+    assert _press(mod, gw.adapter, "rec:j:a:1:1", request_id, user="555") == ["Not allowed."]
+    _press(mod, gw.adapter, "rec:j:a:1:1", request_id)
     assert mod.contacts.find("Omar")["telegram_chat_id"] == "555"
     assert bot.sent_to(555)[-1] == "✅ تم تسجيلك لاستقبال المهام."
     assert bot.messages[request_id] == ("✅ تم ربط Fahad K (@fahad, 555) بـ Omar.", None)
     # Then: full name and role, each typed (or skipped).
     question = max(bot.messages)
     assert bot.messages[question][0] == "الاسم الكامل؟ (Omar)"
-    assert _buttons(bot.messages[question][1]) == [[("تخطي", "rec:j:k:1")]]
+    assert _buttons(bot.messages[question][1]) == [[("تخطي", "rec:j:k:1:0")]]
     assert _dispatch(mod, gw, _event(text="عمر الحربي", message_type="TEXT")) is None
     assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (Omar)"
     assert _dispatch(mod, gw, _event(text="مطور", message_type="TEXT")) is None
@@ -891,12 +909,12 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     assert _dispatch(mod, gw, _event(text="سارة", message_type="TEXT")) is None
     assert mod.contacts.find("سارة")["telegram_chat_id"] == "556"
     assert mod.contacts.find("Omar")["full_name"] == "عمر الحربي"  # the typed name was not a detail
-    _press(mod, gw.adapter, "rec:j:k:2", max(bot.messages))
+    _press(mod, gw.adapter, "rec:j:k:2:0", max(bot.messages))
     assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (سارة)"
-    _press(mod, gw.adapter, "rec:j:k:2", max(bot.messages))
+    _press(mod, gw.adapter, "rec:j:k:2:1", max(bot.messages))
     sara = mod.contacts.find("سارة")
     assert (sara["full_name"], sara["role"]) == (None, None)
-    assert "سارة — ✅ تيليجرام" in mod._cmd_contacts("")
+    assert "👤 سارة\n📅 انضم:" in mod._cmd_contacts("")
     assert mod._cmd_contacts("delete سارة") == "للتأكيد أرسل: /contacts delete سارة confirm"
     assert mod._cmd_contacts("delete سارة confirm") == "🗑️ حُذف سارة." and mod.contacts.find("سارة") is None
 
@@ -953,28 +971,6 @@ def test_a_registered_member_can_use_nothing_else(recorder, telegram_stub, tmp_p
     assert _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", 1, user="555") == ["Not allowed."]
 
 
-class FakeSMTP:
-    sent, logins = [], []
-
-    def __init__(self, host, port, timeout=None):
-        self.host, self.port, self.tls = host, port, False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def starttls(self, context=None):
-        self.tls = True
-
-    def login(self, user, password):
-        FakeSMTP.logins.append((user, password, self.tls))
-
-    def send_message(self, msg):
-        FakeSMTP.sent.append(msg)
-
-
 def _sending_meeting(mod):
     language, brief, _ = mod.brief.normalize(ANALYSIS)
     meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER, manager_name="أبو فيصل")
@@ -991,16 +987,15 @@ def _sending_meeting(mod):
     mod.store.set_task_status(meeting_id, [1, 2, 3, 4, 5, 7], "confirmed")
     mod.store.set_task_status(meeting_id, [6], "removed")
     mod.store.update_meeting(meeting_id, status="confirmed")
-    mod.contacts.link_telegram("Omar", "777", "omar_t")
-    mod.contacts.save_contact("Sara", "sara@tact.sa")
+    mod.contacts.link_telegram("Omar", "777", "omar_t")  # the only member who joined via /invite
     return meeting_id
 
 
 def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub, monkeypatch, caplog):
     mod = recorder
     caplog.set_level(logging.INFO)
-    for var in mod.sending.SMTP_VARS:
-        monkeypatch.delenv(var, raising=False)
+    for var, value in zip(mod.sending.SMTP_VARS, ("smtp.gmail.com", "587", "bot@tact.sa", "app-secret-pw", "bot@tact.sa")):
+        monkeypatch.setenv(var, value)  # even with SMTP configured, email is not a channel any more
     meeting_id = _sending_meeting(mod)
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
@@ -1012,11 +1007,10 @@ def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub
     preview = max(bot.messages)
     text, markup = bot.messages[preview]
     assert "👤 Omar — Telegram\n  • 1. Send the deck\n  • 5. Prepare the launch plan" in text
-    for line in ("2. Sara — email sending not configured", "3. ❓ UNCLEAR: Omar or Sara — owner unclear",
-                 "4. Fahad — contact unknown", "5. Sara — email sending not configured",
-                 "7. Khalid — ⏳ not registered in the bot yet"):
+    for line in ("2. Sara — ⏳ not joined yet", "3. ❓ UNCLEAR: Omar or Sara — owner unclear",
+                 "4. Fahad — ⏳ not joined yet", "5. Sara — ⏳ not joined yet", "7. Khalid — ⏳ not joined yet"):
         assert line in text, line
-    assert "Cancelled idea" not in text
+    assert "Cancelled idea" not in text and "email" not in text
     assert _buttons(markup) == [[("✅ Send", f"rec:x:s:{meeting_id}"), ("❌ Cancel", f"rec:x:c:{meeting_id}")]]
     assert bot.sent_to("777") == []  # nothing without ✅
 
@@ -1025,29 +1019,16 @@ def test_tasks_are_sent_only_after_the_managers_approval(recorder, telegram_stub
 
     _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)
     _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
-    assert bot.sent_to("777") == [f"📋 Your tasks from the meeting on {mod.store.get_meeting(meeting_id, 'telegram', CHAT)['created_at'][:10]}"
-                                  " with أبو فيصل:\n1. Send the deck — Deadline: Tuesday\n"
-                                  "2. Prepare the launch plan — Deadline: Sunday"]
-    tasks = mod.store.tasks_for(meeting_id)
-    assert [t["sent_via"] for t in tasks] == ["telegram", None, None, None, "telegram", None, None]
+    date = mod.store.get_meeting(meeting_id, "telegram", CHAT)["created_at"][:10]
+    assert bot.sent_to("777") == [f"📋 Your tasks from the meeting on {date} with أبو فيصل:\n"
+                                  "1. Send the deck — Deadline: Tuesday\n2. Prepare the launch plan — Deadline: Sunday"]
+    assert [t["sent_via"] for t in mod.store.tasks_for(meeting_id)] == \
+        ["telegram", None, None, None, "telegram", None, None]
     assert gw.adapter.sent[-1].startswith(f"📤 Sending result — Meeting {meeting_id}\n✅ Omar — Telegram: 2 task(s)")
-
-    # Email once SMTP is configured; the joint task now also reaches Sara. Omar's tasks were sent
-    # before, so the preview says they would go again.
-    for var, value in zip(mod.sending.SMTP_VARS, ("smtp.gmail.com", "587", "bot@tact.sa", "app-secret-pw", "bot@tact.sa")):
-        monkeypatch.setenv(var, value)
-    monkeypatch.setattr(mod.sending.smtplib, "SMTP", FakeSMTP)
-    FakeSMTP.sent.clear()
+    # A second 📤 warns before sending the same tasks again.
     _press(mod, gw.adapter, f"rec:x:p:{meeting_id}", ask)
-    assert "👤 Sara — email (sara@tact.sa)\n  • 2. Review the contract\n  • 5. Prepare the launch plan" in \
-        bot.messages[max(bot.messages)][0]
     assert "were sent before and will be sent again" in bot.messages[max(bot.messages)][0]
-    _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(bot.messages))
-    (email,) = FakeSMTP.sent
-    assert email["To"] == "sara@tact.sa" and "Review the contract" in email.get_content()
-    assert FakeSMTP.logins == [("bot@tact.sa", "app-secret-pw", True)]  # STARTTLS before login
-    assert mod.store.tasks_for(meeting_id)[4]["sent_via"] == "telegram,email"
-    assert "app-secret-pw" not in caplog.text and "Send the deck" not in caplog.text
+    assert "Send the deck" not in caplog.text and "app-secret-pw" not in caplog.text
 
 
 def test_name_pickers_offer_only_real_confirmed_people(recorder):
@@ -1061,7 +1042,7 @@ def test_name_pickers_offer_only_real_confirmed_people(recorder):
         for i, (p, c) in enumerate(rows, 1)])
     mod.store.set_task_status(meeting_id, [1, 2, 3, 4, 7, 8, 9], "confirmed")  # Khalid pending, Nasser, سره
     mod.store.set_task_status(meeting_id, [6, 10], "removed")                   # cancelled
-    mod.contacts.save_contact("فهد", "fahad@tact.sa")
+    mod.contacts.link_telegram("فهد", "900")
     picker = mod.contacts.picker_names  # contacts book first, then confirmed owners; one per person
     assert picker("telegram", CHAT) == ["فهد", "Omar", "عمر", "Layla"]
     assert mod.contacts.is_person_name("عبد الله") and not mod.contacts.is_person_name("Omar or Sara")
@@ -1075,7 +1056,7 @@ def test_name_pickers_offer_only_real_confirmed_people(recorder):
     assert [t["person"] for t in mod.store.tasks_for(meeting_id)][:4] == ["عمر", "احمد او عمر (يحدد لاحقا)",
                                                                          "فهد او نورة", "Sara / Omar"]
     assert mod._cmd_contacts("rename فهد → Fahad").startswith("✏️ أُعيدت تسمية فهد إلى Fahad")
-    assert mod.contacts.find("Fahad")["email"] == "fahad@tact.sa" and picker("telegram", CHAT)[0] == "Fahad"
+    assert mod.contacts.find("Fahad")["telegram_chat_id"] == "900" and picker("telegram", CHAT)[0] == "Fahad"
     assert mod._cmd_contacts("rename Fahad -> x / y") == "«x / y» ليس اسماً صالحاً."
 
 
@@ -1085,7 +1066,7 @@ def test_recordings_delete_and_clear_need_confirmation(recorder, telegram_stub, 
     for number in (first, second, third):
         (mod.store.meeting_dir(number) / "transcript.txt").write_text("secret words", encoding="utf-8")
         mod.store.update_meeting(number, transcript_path=str(mod.store.meeting_dir(number) / "transcript.txt"))
-    mod.contacts.save_contact("Omar", "omar@tact.sa")
+    mod.contacts.link_telegram("Omar", "777")
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
     folder = Path(mod.store.recordings_dir())
@@ -1114,7 +1095,7 @@ def test_recordings_delete_and_clear_need_confirmation(recorder, telegram_stub, 
     assert "كل الاجتماعات المسجّلة (1)" in bot.messages[max(bot.messages)][0]
     _press(mod, gw.adapter, "rec:d:y:0", max(bot.messages))
     assert mod.store.recent_meetings("telegram", CHAT) == [] and not (folder / str(third)).exists()
-    assert mod.contacts.find("Omar")["email"] == "omar@tact.sa"  # the contacts book is kept
+    assert mod.contacts.find("Omar")["telegram_chat_id"] == "777"  # the contacts book is kept
 
 
 def test_join_request_comes_with_the_profile_photo_when_there_is_one(recorder, telegram_stub):
@@ -1159,7 +1140,7 @@ def test_a_shared_first_name_is_asked_not_guessed(recorder, telegram_stub, monke
     mod.store.set_task_status(meeting_id, [1, 2], "confirmed")
     mod.store.update_meeting(meeting_id, status="confirmed")
     card = mod.brief.task_card(mod.contacts.annotate(mod.store.tasks_for(meeting_id), "ar")[0], 2, "ar")
-    assert "📞 ❓ فهد العتيبي (مطور) / فهد الشمري (مالية)" in card
+    assert "📞 التواصل: ❓ فهد العتيبي (مطور) / فهد الشمري (مالية)" in card
 
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
@@ -1196,36 +1177,33 @@ def test_team_lists_registered_members_and_contacts_can_be_edited_or_deleted(rec
     assert "team" in dict(telegram_menu_commands()[0])
     assert mod._cmd_team("") == "لا يوجد أحد مسجل بعد — استخدم /invite"
     _two_fahads(mod)
-    mod.contacts.save_contact("فهد", "fahad@tact.sa")
-    mod.contacts.save_contact("نورة", "noura@tact.sa")  # in the book, never registered in the bot
-    mod.contacts.save_contact("خالد", "@khalid_k")       # a username only: not registered either
+    mod.contacts.set_details("نورة", full_name="نورة السالم")  # in the book, never joined through /invite
     today = mod.store.now().isoformat()[:10]
-    assert mod._cmd_team("") == (
-        "👥 الفريق (2)\n\n"
-        f"👤 فهد الشمري\n💼 مالية\n📅 انضم: {today}\n\n"
-        f"👤 فهد العتيبي\n💼 مطور\n🔗 @fahad_dev\n📧 fahad@tact.sa\n📅 انضم: {today}")
+    team = mod._cmd_team("")
+    assert team == ("👥 الفريق (2)\n\n"
+                    f"👤 فهد الشمري\n💼 مالية\n📅 انضم: {today}\n\n"
+                    f"👤 فهد العتيبي\n💼 مطور\n🔗 @fahad_dev\n📅 انضم: {today}")
+    listing = mod._cmd_contacts("")  # /contacts: the same members, then who still needs an invite
+    assert listing.startswith(team) and "⏳ نورة — لم ينضم بعد" in listing
 
     gw = FakeGateway(bot=True)
     bot = gw.adapter._bot
     assert _dispatch(mod, gw, _event(text="/contacts edit نورة", message_type="TEXT")) is None
     edit = max(bot.messages)
-    assert bot.messages[edit][0].startswith("✏️ نورة\nالاسم المختصر: نورة\nالاسم الكامل: —")
+    assert bot.messages[edit][0].startswith("✏️ نورة السالم\nالاسم المختصر: نورة\nالاسم الكامل: نورة السالم")
+    assert "التواصل: ⏳ لم ينضم بعد — أرسل /invite" in bot.messages[edit][0]
     noura = mod.contacts.exact("نورة")["id"]
-    assert _buttons(bot.messages[edit][1]) == [[("👤 الاسم الكامل", f"rec:p:f:{noura}"), ("💼 الوظيفة", f"rec:p:r:{noura}")],
-                                               [("📞 التواصل", f"rec:p:k:{noura}")]]
+    assert _buttons(bot.messages[edit][1]) == [[("👤 الاسم الكامل", f"rec:p:f:{noura}"), ("💼 الوظيفة", f"rec:p:r:{noura}")]]
     assert _press(mod, gw.adapter, f"rec:p:r:{noura}", edit, user="99") == ["Not allowed."]
     _press(mod, gw.adapter, f"rec:p:r:{noura}", edit)
     assert gw.adapter.sent[-1] == "أرسل الوظيفة / القسم لـ نورة"
     assert _dispatch(mod, gw, _event(text="تصميم", message_type="TEXT")) is None
-    assert mod.contacts.exact("نورة")["role"] == "تصميم" and mod.contacts.label_for("نورة") == "نورة (تصميم)"
-    _press(mod, gw.adapter, f"rec:p:k:{noura}", edit)
-    assert _dispatch(mod, gw, _event(text="not a contact", message_type="TEXT")) is None
-    assert gw.adapter.sent[-1].startswith("📞 هذه ليست وسيلة تواصل")
+    assert mod.contacts.exact("نورة")["role"] == "تصميم" and mod.contacts.label_for("نورة") == "نورة السالم (تصميم)"
     # A first name that fits two people asks which one (an exact short name is one person).
-    mod.contacts.save_contact("سعد أ", "saad.a@tact.sa")
-    mod.contacts.save_contact("سعد ب", "saad.b@tact.sa")
+    mod.contacts.set_details("سعد أ", full_name="سعد الأحمد")
+    mod.contacts.set_details("سعد ب", full_name="سعد البكر")
     assert _dispatch(mod, gw, _event(text="/contacts edit سعد", message_type="TEXT")) is None
-    assert [b for row in _buttons(bot.messages[max(bot.messages)][1]) for b, _ in row] == ["سعد أ", "سعد ب"]
+    assert [b for row in _buttons(bot.messages[max(bot.messages)][1]) for b, _ in row] == ["سعد الأحمد", "سعد البكر"]
     assert _dispatch(mod, gw, _event(text="/contacts edit فهد", message_type="TEXT")) is None
     assert bot.messages[max(bot.messages)][0].startswith("✏️ فهد العتيبي (مطور)\nالاسم المختصر: فهد\n")
 
@@ -1237,4 +1215,48 @@ def test_team_lists_registered_members_and_contacts_can_be_edited_or_deleted(rec
     assert "فهد الشمري" in mod._cmd_team("")  # not before ✅
     _press(mod, gw.adapter, "rec:p:d:2", question)
     assert "فهد الشمري" not in mod._cmd_team("") and mod._cmd_team("").startswith("👥 الفريق (1)")
-    assert mod.contacts.route("فهد ش", "", False).reason == "unknown"
+    assert mod.contacts.route("فهد ش").reason == "not_joined"
+
+
+def test_invite_edge_cases_self_invite_expiry_reopen_and_restart(recorder, telegram_stub, monkeypatch):
+    mod = recorder
+    meeting_id = _seed(mod)
+    mod.store.set_task_status(meeting_id, [1], "confirmed")  # Ahmad
+    gw = FakeGateway(bot=True)
+    bot = gw.adapter._bot
+    decided = "هذا الطلب تم التعامل معه أو انتهى"
+
+    token = _invite(mod, gw)
+    _join(mod, gw.adapter, token, user=int(MANAGER))  # the manager opens his own link
+    assert bot.sent_to(MANAGER) == ["أنت المدير — هذا الرابط لدعوة أعضاء الفريق، ولا تحتاج إلى الانضمام."]
+    assert len(bot.sent_to(CHAT)) == 0  # no join request for himself
+
+    # A pending request ends with its link: its buttons then say so and register nobody.
+    _join(mod, gw.adapter, token, user=555)
+    first = max(bot.messages)
+    real_now = mod.invite._now
+    monkeypatch.setattr(mod.invite, "_now", lambda: real_now() + 31 * 60)
+    assert _press(mod, gw.adapter, "rec:j:a:1:0", first) == [decided]
+    assert bot.messages[first][1] is None and mod.contacts.by_chat_id("555") is None
+    monkeypatch.setattr(mod.invite, "_now", real_now)
+
+    # A new link: a new request. Opening it again re-sends the request to the manager.
+    fresh = _invite(mod, gw)
+    _join(mod, gw.adapter, fresh, user=555)
+    second = max(bot.messages)
+    _join(mod, gw.adapter, fresh, user=555)
+    resent = max(bot.messages)
+    assert resent != second and bot.messages[resent][0].startswith("📥 طلب انضمام")
+    assert bot.messages[second] == ("↪️ أُعيد إرسال هذا الطلب أدناه.", None)
+    assert bot.sent_to(555)[-2:] == ["⏳ طلبك بانتظار موافقة المدير."] * 2
+
+    # "Restart": every in-memory state is gone; the buttons work from the database alone.
+    for state in (mod.invite.awaiting_name, mod.invite.awaiting_detail, mod.invite._attempts,
+                  mod._awaiting_edit, mod._person_actions, mod._awaiting_person):
+        state.clear()
+    _press(mod, gw.adapter, "rec:j:a:2:0", resent)
+    assert mod.contacts.find("Ahmad")["telegram_chat_id"] == "555"
+    assert _press(mod, gw.adapter, "rec:j:a:2:0", resent) == [decided]  # already decided
+    mod.invite.awaiting_detail.clear()
+    _press(mod, gw.adapter, "rec:j:k:2:0", max(bot.messages))  # [تخطي] carries its question
+    assert bot.messages[max(bot.messages)][0] == "الوظيفة / القسم؟ (Ahmad)"

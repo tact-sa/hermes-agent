@@ -49,20 +49,15 @@ ASK_FIELD = {
 }
 FIELD_PROMPT = {
     "en": {"person": "Send the new name for task {n}", "task": "Send the new task text for task {n}",
-           "deadline": "Send the new deadline for task {n}",
-           "contact": "Send the contact for task {n}: an email address or @username"},
+           "deadline": "Send the new deadline for task {n}"},
     "ar": {"person": "أرسل الاسم الجديد للمهمة {n}", "task": "أرسل المهمة الجديدة للمهمة {n}",
-           "deadline": "أرسل الموعد الجديد للمهمة {n}",
-           "contact": "أرسل وسيلة التواصل للمهمة {n}: بريد إلكتروني أو @username"},
+           "deadline": "أرسل الموعد الجديد للمهمة {n}"},
 }
 
 
-BAD_CONTACT = {"en": "📞 That is not a contact. Send an email address, a @username or a phone number.",
-               "ar": "📞 هذه ليست وسيلة تواصل. أرسل بريداً إلكترونياً أو @username أو رقم هاتف."}
-PHONE_NOTE = {"en": "📞 Saved, but phone numbers can't be messaged yet; use a @username or an email address.",
-              "ar": "📞 حُفظ الرقم، لكن لا يمكن مراسلة أرقام الهواتف بعد؛ استخدم @username أو البريد الإلكتروني."}
-SAVE_CONTACT = {"en": "Save this contact for {name} for future meetings?",
-                "ar": "حفظ وسيلة التواصل هذه لـ {name} في الاجتماعات القادمة؟"}
+CONTACTS_FROM_INVITES = {
+    "en": "📞 Contacts can't be typed: they come only from members who joined through /invite. Pick one:",
+    "ar": "📞 لا تُكتب وسيلة التواصل يدوياً: التواصل يكون فقط مع الأعضاء الذين انضموا عبر /invite. اختر عضواً:"}
 
 
 def parse_command(text: str) -> Optional[Tuple[str, int, str]]:
@@ -107,7 +102,7 @@ class Outcome:
     acks: Dict[int, str] = field(default_factory=dict)  # text used only when that card can't be edited
     finished: bool = False  # nothing pending any more: the final summary follows
     picker: int = 0  # task number whose card shows the Name / Task / Deadline / Contact choice instead
-    save_contact: int = 0  # task number whose new contact the manager is asked to keep in the book
+    member_picker: int = 0  # task number for which the registered members are offered as its contact
 
 
 def _meeting_lang(meeting: Any) -> str:
@@ -138,9 +133,8 @@ def _already_confirmed(meeting: Any, lang: str) -> str:
 
 
 def _apply_fields(meeting: Any, position: int, fields: Dict[str, str], lang: str, out: Outcome) -> None:
-    """Store edited fields. A contact must be an email / @username / phone; it keeps the task's
-    status and may change after the meeting is confirmed (contacts are needed to send). The manager
-    is then asked once whether to keep it in the contacts book for that person."""
+    """Store edited fields. A typed contact is refused: the manager picks a registered member
+    instead (``member_picker``), which also works after the meeting is confirmed."""
     fields = dict(fields)
     contact = fields.pop("contact", None)
     if fields:
@@ -150,17 +144,8 @@ def _apply_fields(meeting: Any, position: int, fields: Dict[str, str], lang: str
             _update_fields(meeting["id"], position, fields)
             out.changed = [position]
     if contact is not None:
-        kind, value = fmt.classify_contact(contact)
-        if not kind:
-            out.messages.append(BAD_CONTACT[lang])
-        else:
-            store.set_task_contact(meeting["id"], position, value)
-            out.changed = [position]
-            if kind == "phone":
-                out.messages.append(PHONE_NOTE[lang])
-            person = next(t["person"] for t in store.tasks_for(meeting["id"]) if t["position"] == position)
-            if len(fmt.split_owners(person)) == 1 and not contacts.has_value(person, value):
-                out.save_contact = position
+        out.messages.append(CONTACTS_FROM_INVITES[lang])
+        out.member_picker = position
     if out.changed:
         out.acks[position] = _edit_ack(meeting["id"], position, lang)
 
@@ -170,7 +155,7 @@ def set_field(meeting: Any, position: int, field_name: str, value: str) -> Outco
     lang = _meeting_lang(meeting)
     out = Outcome(meeting["id"])
     value = (value or "").strip()
-    if meeting["status"] != "pending" and field_name != "contact":
+    if meeting["status"] != "pending":
         out.messages.append(_already_confirmed(meeting, lang))
         return out
     if not value:

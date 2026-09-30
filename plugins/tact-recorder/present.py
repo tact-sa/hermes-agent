@@ -130,6 +130,11 @@ async def show_changes(adapter: Any, platform: str, chat_id: str, outcome: Outco
     pressed = pressed or {}
     for text in outcome.messages:
         await send(adapter, chat_id, text)
+    if outcome.member_picker and not outcome.changed:  # a typed contact: offer the members instead
+        meeting = store.get_meeting(outcome.meeting_id, platform, chat_id)
+        task = next(t for t in store.tasks_for(outcome.meeting_id) if t["position"] == outcome.member_picker)
+        await send_member_picker(adapter, _bot(adapter, platform), chat_id, outcome.meeting_id, task,
+                                 fmt.lang_of(meeting["language"]))
     if not outcome.changed:
         return
     meeting = store.get_meeting(outcome.meeting_id, platform, chat_id)
@@ -154,26 +159,44 @@ async def show_changes(adapter: Any, platform: str, chat_id: str, outcome: Outco
         text, markup = _all_message(outcome.meeting_id, sum(t["status"] == "pending" for t in tasks), lang)
         for message_id in all_ids:
             await _edit(bot, chat_id, message_id, text, markup)
-    if outcome.save_contact and bot is not None:
-        await _ask_save_contact(bot, chat_id, outcome.meeting_id, by_pos[outcome.save_contact], lang)
+    if outcome.member_picker:
+        await send_member_picker(adapter, bot, chat_id, outcome.meeting_id, by_pos[outcome.member_picker], lang)
     if outcome.finished:
         await send(adapter, chat_id, fmt.final_text(outcome.meeting_id, lang, tasks))
         await offer_sending(bot, chat_id, outcome.meeting_id, lang)
 
 
-async def _ask_save_contact(bot: Any, chat_id: str, meeting_id: int, task: Dict[str, Any], lang: str) -> None:
+NO_MEMBERS = {"ar": "لا يوجد أعضاء مسجلون بعد — أرسل /invite",
+              "en": "No registered members yet — send /invite"}
+
+
+async def send_member_picker(adapter: Any, bot: Any, chat_id: str, meeting_id: int, task: Dict[str, Any],
+                             lang: str) -> None:
+    """📞 for a task: the registered members (as in /team) to link it to, plus [↩️ back]."""
+    members = contacts.members()
+    if bot is None or not members:
+        await send(adapter, chat_id, NO_MEMBERS[lang])
+        return
+    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
+    rows = [[Button(contacts.label(r), callback_data=f"rec:m:a:{meeting_id}:{task['position']}:{r['id']}")]
+            for r in members]
+    rows.append([Button(fmt.LABELS[lang]["btn_back"], callback_data=f"rec:m:b:{meeting_id}:{task['position']}")])
+    who = task["person"] or fmt.owner_text(task, lang, question=False)
+    text = (f"📞 اختر العضو المسجّل للمهمة {task['position']} ({who}):" if lang == "ar"
+            else f"📞 Pick the registered member for task {task['position']} ({who}):")
+    await bot.send_message(chat_id=_chat_arg(chat_id), text=text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def ask_save_alias(bot: Any, chat_id: str, meeting_id: int, position: int, owner: str, member: Dict[str, Any],
+                         lang: str) -> None:
+    """Once per pick: keep the meeting's name for this member so future meetings match it."""
     from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
     yes, no = ("✅ حفظ", "❌ لا") if lang == "ar" else ("✅ Save", "❌ No")
-    await bot.send_message(
-        chat_id=_chat_arg(chat_id), text=_save_question(lang, task["person"]),
-        reply_markup=InlineKeyboardMarkup([[
-            Button(yes, callback_data=f"rec:s:y:{meeting_id}:{task['position']}"),
-            Button(no, callback_data=f"rec:s:n:{meeting_id}:{task['position']}")]]))
-
-
-def _save_question(lang: str, name: str) -> str:
-    from .confirm import SAVE_CONTACT
-    return SAVE_CONTACT[lang].format(name=name)
+    text = (f"حفظ «{owner}» كاسم آخر لـ {contacts.label(member)} في الاجتماعات القادمة؟" if lang == "ar"
+            else f"Save “{owner}” as another name for {contacts.label(member)} in future meetings?")
+    await bot.send_message(chat_id=_chat_arg(chat_id), text=text, reply_markup=InlineKeyboardMarkup([[
+        Button(yes, callback_data=f"rec:s:y:{meeting_id}:{position}"),
+        Button(no, callback_data=f"rec:s:n:{meeting_id}:{position}")]]))
 
 
 async def offer_sending(bot: Any, chat_id: str, meeting_id: int, lang: str) -> None:

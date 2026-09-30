@@ -1,17 +1,15 @@
-"""The contacts book: how to reach each person tasks are assigned to.
+"""The people tasks go to: ONLY members who joined through a manager-approved /invite link.
 
-One row per person: a short name (unique; what meetings usually say), other spellings, an optional
-full name and role (shown as "full name (role)" wherever the manager picks or reads a person), and
-any of: a Telegram chat id (only ever set when the manager approves an invite join, see
-``invite.py``), a Telegram @username, an email, a phone. Names match the way owners do
-(``brief.name_key``) against the short name, the spellings, the full name and first names; when a
-name fits more than one person, nothing is guessed: ``matches`` returns them all and the manager
-picks (the choice is kept on the task as ``contact_id``).
+One row per person: a short name (unique; what meetings usually say), other spellings (aliases),
+an optional full name and role (shown as "full name (role)" wherever the manager picks or reads a
+person), and the Telegram chat id + @username set when the manager approves their join
+(``invite.py``). There is no manual @username, email or phone entry: a person is reachable exactly
+when they are a registered member (``telegram_chat_id``), and ``/team`` lists those members.
 
-``route`` decides how a task reaches one owner: the task's own contact (said in the meeting or set
-by the manager) first, else the book. Telegram needs a chat id: a bot cannot message someone who
-never started it, so an @username alone is "not registered yet". Email needs SMTP configured.
-Phones are stored but cannot be messaged yet.
+A task reaches its owner's member, matched by short name, aliases, full name or first name
+(``brief.name_key``), or the member the manager picked for that task (``tasks.contact_id``). A name
+that fits more than one member is never guessed: the manager chooses in the send preview.
+Older email / phone / username values in the table are no longer read.
 """
 
 from __future__ import annotations
@@ -156,13 +154,34 @@ def _upsert(name: str, **fields: Any) -> None:
             con.execute(f"UPDATE contacts SET {cols} WHERE id = ?", (*fields.values(), row["id"]))
 
 
-def save_contact(name: str, contact: str) -> bool:
-    """Store an email / @username / phone for *name*; False when *contact* is none of those."""
-    kind, value = fmt.classify_contact(contact)
-    if not kind:
-        return False
-    _upsert(name, **{{"email": "email", "username": "telegram_username", "phone": "phone"}[kind]: value})
-    return True
+def is_member(row: Optional[Dict[str, Any]]) -> bool:
+    return bool(row and row["telegram_chat_id"])
+
+
+def members() -> List[Dict[str, Any]]:
+    """Registered members, sorted by the name the manager sees."""
+    return sorted((r for r in all_contacts() if is_member(r)), key=lambda r: fmt.name_key(r["full_name"] or r["name"]))
+
+
+def members_for(name: str) -> List[Dict[str, Any]]:
+    return [r for r in matches(name) if is_member(r)]
+
+
+def knows(row: Dict[str, Any], name: str) -> bool:
+    """Whether *name* already leads to this member (short name, alias or full name)."""
+    key = fmt.name_key(name)
+    return key in {row["name_key"], fmt.name_key(row["full_name"] or "")} | {fmt.name_key(a) for a in row["aliases"]}
+
+
+def add_alias(contact_id: Any, alias: str) -> None:
+    """Remember that meetings call this member *alias* (the manager confirmed it)."""
+    row = by_id(contact_id)
+    if row is None or knows(row, alias):
+        return
+    with _connect() as con:
+        con.execute("UPDATE contacts SET aliases = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(row["aliases"] + [fmt.clean(alias)], ensure_ascii=False),
+                     store.now().isoformat(timespec="seconds"), row["id"]))
 
 
 def link_telegram(name: str, chat_id: str, username: str = "") -> None:
@@ -231,84 +250,49 @@ def rename(old: str, new: str) -> Tuple[bool, str]:
     return True, f"✏️ أُعيدت تسمية {old} إلى {new}" + (f" (في {tasks} مهمة)" if tasks else "") + "."
 
 
-def has_value(name: str, contact: str) -> bool:
-    """Whether the book already holds exactly this contact for *name* (no need to ask again)."""
-    kind, value = fmt.classify_contact(contact)
-    row = exact(name)
-    column = {"email": "email", "username": "telegram_username", "phone": "phone"}.get(kind)
-    return bool(row and column and (row[column] or "").casefold() == value.casefold())
-
-
 # -- routing and display -------------------------------------------------------------------------
 
 class Route(NamedTuple):
-    channel: str  # "telegram" / "email", or "" when the task can't be sent to this person
-    target: str  # chat id / email address
-    reason: str  # why not: unknown / not_registered / email_off / phone / ambiguous
-    who: str = ""  # the person's label, when known
-    choices: tuple = ()  # the contacts an ambiguous name may mean
+    channel: str  # "telegram", or "" when the task can't be sent to this person
+    target: str  # the member's chat id
+    reason: str  # why not: not_joined / ambiguous
+    who: str = ""  # the member's label, when known
+    choices: tuple = ()  # the members an ambiguous name may mean
 
 
-def route(name: str, explicit: str, email_ready: bool, contact_id: Any = None) -> Route:
-    kind, value = fmt.classify_contact(explicit)
-    row = None
-    if kind == "username":
-        row = by_username(value)
-        return Route("telegram", row["telegram_chat_id"], "") if row and row["telegram_chat_id"] else \
-            Route("", "", "not_registered")
-    if kind == "email":
-        return Route("email", value, "") if email_ready else Route("", "", "email_off")
-    if kind == "phone":
-        return Route("", "", "phone")
-    found = [by_id(contact_id)] if contact_id and by_id(contact_id) else matches(name)
+def route(name: str, contact_id: Any = None) -> Route:
+    """How a task reaches one owner: their registered member, or why not."""
+    chosen = by_id(contact_id) if contact_id else None
+    found = [chosen] if is_member(chosen) else members_for(name)
     if len(found) > 1:
         return Route("", "", "ambiguous", choices=tuple(found))
-    row = found[0] if found else None
-    who = label(row) if row else ""
-    if row and row["telegram_chat_id"]:
-        return Route("telegram", row["telegram_chat_id"], "", who)
-    if row and row["email"]:
-        return Route("email", row["email"], "", who) if email_ready else Route("", "", "email_off", who)
-    if row and row["telegram_username"]:
-        return Route("", "", "not_registered", who)
-    if row and row["phone"]:
-        return Route("", "", "phone", who)
-    return Route("", "", "unknown", who)
+    if not found:
+        return Route("", "", "not_joined")
+    return Route("telegram", found[0]["telegram_chat_id"], "", label(found[0]))
 
 
-def row_text(row: Dict[str, Any], lang: str) -> str:
-    """How a book entry reads on a card or in /contacts."""
+def member_text(row: Dict[str, Any], lang: str) -> str:
     labels = fmt.LABELS[lang]
-    telegram = "تيليجرام" if lang == "ar" else "Telegram"
-    parts = []
-    if row["telegram_chat_id"]:
-        parts.append(f"✅ {telegram}" + (f" ({row['telegram_username']})" if row["telegram_username"] else ""))
-    elif row["telegram_username"]:
-        parts.append(f"{row['telegram_username']} ({labels['not_registered']})")
-    parts += [v for v in (row["email"], row["phone"]) if v]
-    return " · ".join(parts)
+    username = row["telegram_username"]
+    return labels["registered"].format(username=username) if username else labels["registered_plain"]
 
 
 def display(task: Dict[str, Any], lang: str) -> str:
+    """"✅ @username (مسجل)" / "⏳ لم ينضم بعد — أرسل /invite" per owner ("—" when unclear)."""
     labels = fmt.LABELS[lang]
-    kind, value = fmt.classify_contact(task.get("contact") or "")
-    if kind == "username":
-        row = by_username(value)
-        return value if row and row["telegram_chat_id"] else f"{value} ({labels['not_registered']})"
-    if kind:
-        return value
     names = fmt.split_owners(task["person"])
+    if not names:
+        return labels["no_owner"]
     chosen = by_id(task["contact_id"]) if len(names) == 1 and task.get("contact_id") else None
     parts = []
     for name in names:
-        found = [chosen] if chosen else matches(name)
+        found = [chosen] if is_member(chosen) else members_for(name)
         if len(found) > 1:  # shared first name: the manager chooses in the send preview
             text = "❓ " + " / ".join(label(r) for r in found)
         else:
-            text = row_text(found[0], lang) if found else ""
-        if text:
-            parts.append(f"{name}: {text}" if len(names) > 1 else text)
-    return "، ".join(parts) or labels["unknown"]
+            text = member_text(found[0], lang) if found else labels["not_joined"]
+        parts.append(f"{name}: {text}" if len(names) > 1 else text)
+    return "، ".join(parts)
 
 
 def annotate(tasks: List[Dict[str, Any]], lang: str) -> List[Dict[str, Any]]:
@@ -318,22 +302,33 @@ def annotate(tasks: List[Dict[str, Any]], lang: str) -> List[Dict[str, Any]]:
     return tasks
 
 
-def list_text() -> str:
-    rows = all_contacts()
-    if not rows:
-        return "👥 لا توجد جهات اتصال بعد. أرسل /invite لدعوة شخص عبر تيليجرام."
-    lines = [f"👥 جهات الاتصال ({len(rows)}):"]
-    for row in rows:
-        lines.append(f"• {label(row)} — {row_text(row, 'ar') or 'غير معروف'}")
-    lines.append("تعديل: /contacts edit <الاسم> · حذف: /contacts delete <الاسم> · "
+def not_joined(platform: str, chat_id: str) -> List[str]:
+    """Owners of confirmed tasks from recent meetings (and book entries) with no registered member."""
+    hidden = _hidden()
+    names = [r["name"] for r in all_contacts() if not is_member(r)]
+    names += [n for person in store.recent_people(platform, chat_id) for n in fmt.split_owners(person)]
+    unique: Dict[str, str] = {}
+    for name in names:
+        key = fmt.name_key(name)
+        if is_person_name(name) and key not in hidden and not members_for(name):
+            unique.setdefault(key, fmt.clean(name))
+    return list(unique.values())
+
+
+def list_text(platform: str, chat_id: str) -> str:
+    """/contacts: the registered members (as in /team), then who still needs an invite."""
+    waiting = not_joined(platform, chat_id)
+    parts = [team_text()] if members() else ["👥 لا يوجد أعضاء مسجلون بعد."]
+    if waiting:
+        parts.append("لم ينضموا بعد (أرسل لهم /invite):\n" + "\n".join(f"⏳ {n} — لم ينضم بعد" for n in waiting))
+    parts.append("تعديل: /contacts edit <الاسم> · حذف: /contacts delete <الاسم> · "
                  "تصحيح اسم: /contacts rename <القديم> -> <الجديد>")
-    return "\n".join(lines)
+    return "\n\n".join(parts)
 
 
 def team_text() -> str:
     """/team: only people the manager approved and who registered in the bot."""
-    rows = sorted((r for r in all_contacts() if r["telegram_chat_id"]),
-                  key=lambda r: fmt.name_key(r["full_name"] or r["name"]))
+    rows = members()
     if not rows:
         return "لا يوجد أحد مسجل بعد — استخدم /invite"
     blocks = []
@@ -343,10 +338,6 @@ def team_text() -> str:
             lines.append(f"💼 {row['role']}")
         if row["telegram_username"]:
             lines.append(f"🔗 {row['telegram_username']}")
-        reach = " · ".join(v for v in (f"📧 {row['email']}" if row["email"] else "",
-                                       f"📞 {row['phone']}" if row["phone"] else "") if v)
-        if reach:
-            lines.append(reach)
         lines.append(f"📅 انضم: {(row['joined_at'] or row['updated_at'])[:10]}")
         blocks.append("\n".join(lines))
     return f"👥 الفريق ({len(rows)})\n\n" + "\n\n".join(blocks)
@@ -357,5 +348,5 @@ def edit_text(row: Dict[str, Any]) -> str:
             f"الاسم المختصر: {row['name']}\n"
             f"الاسم الكامل: {row['full_name'] or '—'}\n"
             f"الوظيفة / القسم: {row['role'] or '—'}\n"
-            f"التواصل: {row_text(row, 'ar') or 'غير معروف'}\n"
+            f"التواصل: {member_text(row, 'ar') if is_member(row) else fmt.LABELS['ar']['not_joined']}\n"
             "اختر ما تريد تعديله:")
