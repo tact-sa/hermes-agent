@@ -120,6 +120,16 @@ def invite_text(bot_username: str, token: str, expires_at: float) -> str:
             "لإلغاء كل الروابط: /invite revoke")
 
 
+def link_message(adapter: Any, platform: str, chat_id: str, user_id: str) -> str:
+    """A fresh 30-minute invite link for this manager, as the text to show them."""
+    finder = getattr(adapter, "_current_bot_username", None)
+    username = finder() if callable(finder) else (getattr(getattr(adapter, "_bot", None), "username", "") or "")
+    if not username:
+        return "تعذّر معرفة اسم البوت؛ حاول مرة أخرى بعد قليل."
+    token, expires_at = create_invite(platform, str(chat_id), str(user_id))
+    return invite_text(username.lstrip("@"), token, expires_at)
+
+
 # -- joining ---------------------------------------------------------------------------------------
 
 def _rate_limited(user_id: str) -> bool:

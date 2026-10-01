@@ -4,7 +4,7 @@ One row per person: a short name (unique; what meetings usually say), other spel
 an optional full name and role (shown as "full name (role)" wherever the manager picks or reads a
 person), and the Telegram chat id + @username set when the manager approves their join
 (``invite.py``). There is no manual @username, email or phone entry: a person is reachable exactly
-when they are a registered member (``telegram_chat_id``), and ``/team`` lists those members.
+when they are a registered member (``telegram_chat_id``), and ``/team`` is the panel that manages them.
 
 A task reaches its owner's member, matched by short name, aliases, full name or first name
 (``brief.name_key``), or the member the manager picked for that task (``tasks.contact_id``). A name
@@ -33,7 +33,7 @@ def _connect():
     for column in ("full_name", "role", "joined_at"):  # added after the first release
         if column not in {row[1] for row in con.execute("PRAGMA table_info(contacts)")}:
             con.execute(f"ALTER TABLE contacts ADD COLUMN {column} TEXT")
-    # Names the manager removed (/contacts delete) that live on in past tasks: kept out of pickers.
+    # Names the manager removed (removed in the /team panel) that live on in past tasks: kept out of pickers.
     con.execute("CREATE TABLE IF NOT EXISTS hidden_names (name_key TEXT PRIMARY KEY)")
     return con
 
@@ -336,17 +336,6 @@ def not_joined(platform: str, chat_id: str) -> List[str]:
     return list(unique.values())
 
 
-def list_text(platform: str, chat_id: str) -> str:
-    """/contacts: the registered members (as in /team), then who still needs an invite."""
-    waiting = not_joined(platform, chat_id)
-    parts = [team_text()] if members() else ["👥 لا يوجد أعضاء مسجلون بعد."]
-    if waiting:
-        parts.append("لم ينضموا بعد (أرسل لهم /invite):\n" + "\n".join(f"⏳ {n} — لم ينضم بعد" for n in waiting))
-    parts.append("تعديل: /contacts edit <الاسم> · حذف: /contacts delete <الاسم> · "
-                 "تصحيح اسم: /contacts rename <القديم> -> <الجديد>")
-    return "\n\n".join(parts)
-
-
 def team_text() -> str:
     """/team: only people the manager approved and who registered in the bot."""
     rows = members()
@@ -362,12 +351,3 @@ def team_text() -> str:
         lines.append(f"📅 انضم: {(row['joined_at'] or row['updated_at'])[:10]}")
         blocks.append("\n".join(lines))
     return f"👥 الفريق ({len(rows)})\n\n" + "\n\n".join(blocks)
-
-
-def edit_text(row: Dict[str, Any]) -> str:
-    return (f"✏️ {label(row)}\n"
-            f"الاسم المختصر: {row['name']}\n"
-            f"الاسم الكامل: {row['full_name'] or '—'}\n"
-            f"الوظيفة / القسم: {row['role'] or '—'}\n"
-            f"التواصل: {member_text(row, 'ar') if is_member(row) else fmt.LABELS['ar']['not_joined']}\n"
-            "اختر ما تريد تعديله:")

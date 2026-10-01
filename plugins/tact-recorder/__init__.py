@@ -24,7 +24,7 @@ button flows keep working), edited in place as tasks are handled; otherwise one 
 Nothing goes to anyone but the manager until the manager, after confirming, taps [📤 Send tasks]
 and then ✅ under the preview (``sending.py``): each person then gets only their own confirmed
 tasks on Telegram. Only members who joined through a manager-approved ``/invite`` link
-(``invite.py``) can be reached; a task reaches its owner's member (``contacts.py``, ``/team``).
+(``invite.py``) can be reached; a task reaches its owner's member (``contacts.py``, managed from the ``/team`` panel in ``team.py``).
 
 The brief is retried once inside ``brief.analyze`` when the model returns no usable JSON; if it
 still fails the transcript stays saved and ``/brief <id> retry`` writes the brief again from it
@@ -57,6 +57,8 @@ from . import invite
 from . import present
 from . import sending
 from . import store
+from . import team
+from . import ui
 
 logger = logging.getLogger(__name__)
 
@@ -80,18 +82,10 @@ _minutes_armed: Dict[Tuple[str, str], float] = {}
 _BUTTON_RE = re.compile(r"^rec:([acerfbu]):(\d+):(\d+)(?::([ntdk]))?$")
 # rec:x:<p|s|c>:<meeting> sending, rec:s:<y|n>:<meeting>:<task> save contact, rec:j:<a|o|r>:<request>[:<i>] join
 # rec:d:<y|n>:<meeting, 0 = all> delete recordings; rec:w:a:<meeting>:<task>:<contact> which person a
-# shared first name means; rec:p:<e|f|r|k|d|n>:<contact> edit / delete a contact
+# shared first name means; rec:t:<action>:<ref> the /team panel (team.py)
 # rec:m:<a|b>:<meeting>:<task>[:<member>] link a task to a registered member; rec:s:<y|n>:<meeting>:<task>
 # keep the task's owner name as that member's alias
-_EXTRA_RE = re.compile(r"^rec:([xsjdwpm]):([a-z]):(\d+)(?::(\d+))?(?::(\d+))?$")
-_CONTACTS_RE = re.compile(r"^(edit|تعديل|delete|remove|حذف|احذف)\s+(.+?)$", re.IGNORECASE)
-PERSON_ACTION_TTL = 15 * 60
-# (chat_id, contact id) -> (manager user id, expiry): contact buttons shown to that manager, so a
-# crafted callback from anyone else (or later) does nothing
-_person_actions: Dict[Tuple[str, str], Tuple[str, float]] = {}
-# (platform, chat_id) -> (contact id, field, expiry) after a contact field button
-_awaiting_person: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
-_PERSON_FIELDS = {"f": ("full_name", "الاسم الكامل"), "r": ("role", "الوظيفة / القسم")}
+_EXTRA_RE = re.compile(r"^rec:([xsjdwm]):([a-z]):(\d+)(?::(\d+))?(?::(\d+))?$")
 _DELETE_RE = re.compile(r"^(?:delete|remove|حذف)\s+#?(\d+)(\s+confirm)?$|^(clear)(\s+confirm)?$", re.IGNORECASE)
 _BUTTON_ACTIONS = {"a": "all", "c": "confirm", "e": "edit", "r": "remove", "f": "field", "b": "back", "u": "undo"}
 _BUTTON_FIELDS = {"n": "person", "t": "task", "d": "deadline", "k": "contact"}
@@ -303,12 +297,9 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
                   and key[0] == "telegram" and _DELETE_RE.match(event.get_command_args().strip()))
     if delete_cmd and (delete_cmd.group(2) or delete_cmd.group(4)):
         delete_cmd = None
-    contacts_cmd = (command == "contacts" and not has_attachment and getattr(adapter, "_bot", None) is not None
-                    and key[0] == "telegram" and _CONTACTS_RE.match(event.get_command_args().strip()))
-    if contacts_cmd and contacts_cmd.group(2).lower().endswith(" confirm"):
-        contacts_cmd = None
+    team_cmd = command == "team" and not has_attachment and ui.has_buttons(adapter, key[0])
     # Other commands (a bare /minutes included) go on to the gateway's command dispatch.
-    if (not kind and not retry and not show and not invite_cmd and not delete_cmd and not contacts_cmd
+    if (not kind and not retry and not show and not invite_cmd and not delete_cmd and not team_cmd
             and (has_attachment or not text.strip() or command)):
         return None
     # Only the manager: anyone else continues to the gateway's normal refusal / pairing path.
@@ -322,17 +313,15 @@ async def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: 
         if delete_cmd:
             await _ask_delete(adapter, source, int(delete_cmd.group(1) or 0))
             return {"action": "skip", "reason": "tact-recorder: delete recordings"}
-        if contacts_cmd:
-            await _contacts_action(adapter, source, contacts_cmd.group(1).lower(), fmt.clean(contacts_cmd.group(2)))
-            return {"action": "skip", "reason": "tact-recorder: contacts"}
+        if team_cmd:
+            await team.show_list(adapter, *key)
+            return {"action": "skip", "reason": "tact-recorder: team panel"}
         if invite_cmd:
             await _send(adapter, source.chat_id, _invite_reply(adapter, source, invite_cmd.group(0)))
             return {"action": "skip", "reason": "tact-recorder: invite"}
         if not command and not has_attachment:
-            person_reply = await _take_person_value(adapter, key, str(source.user_id), text)
-            if person_reply is not None:  # a contact's full name / role / contact after its field button
-                await _send(adapter, source.chat_id, person_reply)
-                return {"action": "skip", "reason": "tact-recorder: contact edit"}
+            if await team.take_input(adapter, *key, str(source.user_id), text):  # after a /team field button
+                return {"action": "skip", "reason": "tact-recorder: team edit"}
             typed = await invite.take_typed_name(getattr(adapter, "_bot", None), *key, str(source.user_id), text)
             if typed is not None:  # the name for a join request after "➕ اسم آخر"
                 for reply in typed:
@@ -426,100 +415,10 @@ async def _ask_delete(adapter: Any, source: Any, meeting_id: int) -> None:
                                Button("❌ إلغاء", callback_data=f"rec:d:n:{meeting_id}")]])))
 
 
-def _allow_person_action(chat_id: str, contact_id: Any, user_id: str) -> None:
-    _person_actions[(str(chat_id), str(contact_id))] = (str(user_id), time.monotonic() + PERSON_ACTION_TTL)
-
-
-def _may_act_on_person(chat_id: str, contact_id: Any, user_id: str) -> bool:
-    allowed = _person_actions.get((str(chat_id), str(contact_id)))
-    return bool(allowed and allowed[0] == str(user_id) and allowed[1] > time.monotonic())
-
-
-def _person_markup(row: Dict[str, Any]) -> Any:
-    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([
-        [Button("👤 الاسم الكامل", callback_data=f"rec:p:f:{row['id']}"),
-         Button("💼 الوظيفة", callback_data=f"rec:p:r:{row['id']}")]])
-
-
-async def _contacts_action(adapter: Any, source: Any, verb: str, name: str) -> None:
-    """``/contacts edit|delete <name>`` with buttons; a name fitting several people asks which."""
-    from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
-    chat, user = str(source.chat_id), str(source.user_id)
-    deleting = verb not in ("edit", "تعديل")
-    exact = contacts.exact(name)
-    rows = [exact] if exact else contacts.matches(name)
-    if not rows:
-        reply = _cmd_contacts(f"delete {name}") if deleting else f"لا توجد جهة اتصال باسم {name}."
-        await _send(adapter, chat, reply)  # a name only in past tasks is hidden right away
-        return
-    for row in rows:
-        _allow_person_action(chat, row["id"], user)
-    if deleting:
-        text = (f"🗑️ حذف {contacts.label(rows[0])} من جهات الاتصال؟"
-                + (" هو مسجّل في البوت وسيتوقف عن استقبال المهام." if rows[0]["telegram_chat_id"] else "")
-                if len(rows) == 1 else f"أكثر من شخص باسم {name}. من تريد حذفه؟")
-        buttons = [[Button("✅ حذف" if len(rows) == 1 else f"🗑️ {contacts.label(r)}",
-                           callback_data=f"rec:p:d:{r['id']}")] for r in rows]
-        buttons.append([Button("❌ إلغاء", callback_data=f"rec:p:n:{rows[0]['id']}")])
-        markup = InlineKeyboardMarkup(buttons)
-    elif len(rows) == 1:
-        text, markup = contacts.edit_text(rows[0]), _person_markup(rows[0])
-    else:
-        text = f"أكثر من شخص باسم {name}. من تريد تعديله؟"
-        markup = InlineKeyboardMarkup([[Button(contacts.label(r), callback_data=f"rec:p:e:{r['id']}")] for r in rows])
-    await adapter._bot.send_message(chat_id=present._chat_arg(chat), text=text, reply_markup=markup)
-
-
-async def _person_button(adapter: Any, action: str, contact_id: int, chat_id: str, user_id: str,
-                         message_id: Any) -> str:
-    if not _may_act_on_person(chat_id, contact_id, user_id):
-        return "Not allowed."
-    bot = adapter._bot
-    row = contacts.by_id(contact_id)
-    if row is None:
-        await present._edit(bot, chat_id, message_id, "لم تعد جهة الاتصال موجودة.", None)
-        return ""
-    if action == "e":
-        await present._edit(bot, chat_id, message_id, contacts.edit_text(row), _person_markup(row))
-    elif action in _PERSON_FIELDS:
-        field, title = _PERSON_FIELDS[action]
-        _awaiting_person[("telegram", str(chat_id))] = (str(contact_id), field, time.monotonic() + EDIT_TTL_SECONDS)
-        await _send(adapter, chat_id, f"أرسل {title} لـ {row['name']}")
-    elif action == "d":
-        contacts.delete(row["name"])
-        for key in [k for k in _person_actions if k[1] == str(contact_id)]:
-            _person_actions.pop(key, None)
-        await present._edit(bot, chat_id, message_id,
-                            f"🗑️ حُذف {contacts.label(row)}. لن يستقبل مهاماً بعد الآن.", None)
-    else:  # "n": keep
-        await present._edit(bot, chat_id, message_id, "لم يُحذف شيء.", None)
-    return ""
-
-
-async def _take_person_value(adapter: Any, key: Tuple[str, str], user_id: str, text: str) -> Optional[str]:
-    waiting = _awaiting_person.pop(key, None)
-    if waiting is None or waiting[2] <= time.monotonic() or not _may_act_on_person(key[1], waiting[0], user_id):
-        return None
-    row = contacts.by_id(waiting[0])
-    if row is None:
-        return "لم تعد جهة الاتصال موجودة."
-    contacts.set_details(row["name"], **{waiting[1]: text})
-    row = contacts.by_id(waiting[0])
-    await adapter._bot.send_message(chat_id=present._chat_arg(key[1]), text="✅ حُفظ.\n" + contacts.edit_text(row),
-                                    reply_markup=_person_markup(row))
-    return ""
-
-
 def _invite_reply(adapter: Any, source: Any, args: str) -> str:
     if args:
         return f"🚫 أُلغيت روابط الدعوة النشطة ({invite.revoke_invites(str(source.user_id))})."
-    finder = getattr(adapter, "_current_bot_username", None)
-    username = finder() if callable(finder) else (getattr(getattr(adapter, "_bot", None), "username", "") or "")
-    if not username:
-        return "تعذّر معرفة اسم البوت؛ حاول مرة أخرى بعد قليل."
-    token, expires_at = invite.create_invite(_platform(source), str(source.chat_id), str(source.user_id))
-    return invite.invite_text(username.lstrip("@"), token, expires_at)
+    return invite.link_message(adapter, _platform(source), str(source.chat_id), str(source.user_id))
 
 
 async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: str, message_id: Any) -> str:
@@ -530,8 +429,6 @@ async def handle_extra_button(adapter: Any, data: str, chat_id: str, user_id: st
         return ""
     kind, action, number, extra = m.group(1), m.group(2), int(m.group(3)), int(m.group(4) or 0)
     bot = getattr(adapter, "_bot", None)
-    if kind == "p":
-        return await _person_button(adapter, action, number, chat_id, user_id, message_id)
     if kind == "d":  # only the manager whose meetings they are; nothing is deleted without ✅
         if _delete_question(number, "telegram", chat_id, user_id) is None:
             return "Not allowed."
@@ -626,6 +523,11 @@ def _telegram_handlers(app: Any, adapter: Any) -> None:
             accept()
         query = update.callback_query
         chat_id = str(query.message.chat.id)
+        if team.CALLBACK_RE.match(query.data or ""):
+            await team.handle_button(adapter, query.data, "telegram", chat_id, str(query.from_user.id),
+                                     query.message.message_id)
+            await query.answer()
+            return
         if _EXTRA_RE.match(query.data or ""):
             toast = await handle_extra_button(adapter, query.data, chat_id, str(query.from_user.id),
                                               query.message.message_id)
@@ -666,25 +568,8 @@ def _cmd_invite(_raw_args: str) -> str:
 
 
 def _cmd_team(_raw_args: str) -> str:
+    """Only reached where the hook did not open the button panel (no private Telegram chat): a plain list."""
     return contacts.team_text()
-
-
-def _cmd_contacts(raw_args: str) -> str:
-    """Only reached where the hook did not answer with buttons (no private Telegram chat), and for
-    names that exist only in past tasks."""
-    args = str(raw_args or "").strip()
-    if re.match(r"^(?:edit|تعديل)\s+", args, re.IGNORECASE):
-        return "استخدم /contacts edit في محادثتك الخاصة مع البوت على تيليجرام."
-    renamed = re.match(r"^(?:rename|تسمية|إعادة تسمية)\s+(.+?)\s*(?:->|→|=>|>)\s*(.+)$", args, re.IGNORECASE)
-    if renamed:
-        return contacts.rename(renamed.group(1), renamed.group(2))[1]
-    m = re.match(r"^(?:delete|remove|حذف|احذف)\s+(.+?)(\s+confirm)?$", args, re.IGNORECASE)
-    if m:
-        name = fmt.clean(m.group(1))
-        if contacts.exact(name) is not None and not m.group(2):  # a book entry: confirm first
-            return f"للتأكيد أرسل: /contacts delete {name} confirm"
-        return f"🗑️ حُذف {name}." if contacts.delete(name) else f"لا توجد جهة اتصال باسم {name}."
-    return contacts.list_text(*_chat())
 
 
 def _cmd_minutes(_raw_args: str) -> str:
@@ -759,8 +644,7 @@ def register(ctx) -> None:
                          description="Take meeting minutes from next audio")
     ctx.register_command("invite", _cmd_invite,
                          description="Invite link so a team member can receive tasks")
-    ctx.register_command("contacts", _cmd_contacts, description="Who can receive tasks, and how")
-    ctx.register_command("team", _cmd_team, description="Team members registered to receive tasks")
+    ctx.register_command("team", _cmd_team, description="Manage the people who receive tasks")
     ctx.register_command("recordings", _cmd_recordings,
                          description="List recorded meetings (delete <id> / clear)")
     ctx.register_command("brief", _cmd_brief, description="Show a recorded meeting's brief and tasks",

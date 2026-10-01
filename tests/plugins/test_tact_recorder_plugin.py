@@ -918,9 +918,7 @@ def test_invite_registration_needs_the_managers_approval(recorder, telegram_stub
     _press(mod, gw.adapter, "rec:j:k:2:1", max(bot.messages))
     sara = mod.contacts.find("سارة")
     assert (sara["full_name"], sara["role"]) == (None, None)
-    assert "👤 سارة\n📅 انضم:" in mod._cmd_contacts("")
-    assert mod._cmd_contacts("delete سارة") == "للتأكيد أرسل: /contacts delete سارة confirm"
-    assert mod._cmd_contacts("delete سارة confirm") == "🗑️ حُذف سارة." and mod.contacts.find("سارة") is None
+    assert "👤 سارة\n📅 انضم:" in mod._cmd_team("")
 
 
 def test_rejected_expired_revoked_and_rate_limited_joins(recorder, telegram_stub, monkeypatch):
@@ -1051,17 +1049,16 @@ def test_name_pickers_offer_only_real_confirmed_people(recorder):
     assert picker("telegram", CHAT) == ["فهد", "Omar", "عمر", "Layla"]
     assert mod.contacts.is_person_name("عبد الله") and not mod.contacts.is_person_name("Omar or Sara")
 
-    # /contacts delete also hides a name that only lives in past tasks; rename fixes it everywhere.
-    assert mod._cmd_contacts("delete Layla") == "🗑️ حُذف Layla."
-    assert mod._cmd_contacts("delete Nobody") == "لا توجد جهة اتصال باسم Nobody."
-    assert mod._cmd_contacts("rename Omar -> عمر") == "✏️ أُعيدت تسمية Omar إلى عمر (في 1 مهمة)."
+    # Removing hides a name that only lives in past tasks; rename fixes it everywhere.
+    assert mod.contacts.delete("Layla") and not mod.contacts.delete("Nobody")
+    assert mod.contacts.rename("Omar", "عمر") == (True, "✏️ أُعيدت تسمية Omar إلى عمر (في 1 مهمة).")
     assert picker("telegram", CHAT) == ["فهد", "عمر"]
     # Only real owner names are renamed; a placeholder like "Sara / Omar" is left as it was.
     assert [t["person"] for t in mod.store.tasks_for(meeting_id)][:4] == ["عمر", "احمد او عمر (يحدد لاحقا)",
                                                                          "فهد او نورة", "Sara / Omar"]
-    assert mod._cmd_contacts("rename فهد → Fahad").startswith("✏️ أُعيدت تسمية فهد إلى Fahad")
+    assert mod.contacts.rename("فهد", "Fahad")[1].startswith("✏️ أُعيدت تسمية فهد إلى Fahad")
     assert mod.contacts.find("Fahad")["telegram_chat_id"] == "900" and picker("telegram", CHAT)[0] == "Fahad"
-    assert mod._cmd_contacts("rename Fahad -> x / y") == "«x / y» ليس اسماً صالحاً."
+    assert mod.contacts.rename("Fahad", "x / y") == (False, "«x / y» ليس اسماً صالحاً.")
 
 
 def test_recordings_delete_and_clear_need_confirmation(recorder, telegram_stub, monkeypatch):
@@ -1175,51 +1172,202 @@ def test_a_shared_first_name_is_asked_not_guessed(recorder, telegram_stub, monke
     assert mod.contacts.exact("فهد ق")["telegram_chat_id"] == "803"
 
 
-def test_team_lists_registered_members_and_contacts_can_be_edited_or_deleted(recorder, telegram_stub):
+def test_plain_team_list_where_there_are_no_buttons(recorder, telegram_stub):
     from hermes_cli.commands_platforms import telegram_menu_commands
     mod = recorder
-    assert "team" in dict(telegram_menu_commands()[0])
+    menu = dict(telegram_menu_commands()[0])
+    assert "team" in menu and "invite" in menu and "contacts" not in menu
     assert mod._cmd_team("") == "لا يوجد أحد مسجل بعد — استخدم /invite"
     _two_fahads(mod)
-    mod.contacts.set_details("نورة", full_name="نورة السالم")  # in the book, never joined through /invite
     today = mod.store.now().isoformat()[:10]
-    team = mod._cmd_team("")
-    assert team == ("👥 الفريق (2)\n\n"
-                    f"👤 فهد الشمري\n💼 مالية\n📅 انضم: {today}\n\n"
-                    f"👤 فهد العتيبي\n💼 مطور\n🔗 @fahad_dev\n📅 انضم: {today}")
-    listing = mod._cmd_contacts("")  # /contacts: the same members, then who still needs an invite
-    assert listing.startswith(team) and "⏳ نورة — لم ينضم بعد" in listing
+    assert mod._cmd_team("") == ("👥 الفريق (2)\n\n"
+                                 f"👤 فهد الشمري\n💼 مالية\n📅 انضم: {today}\n\n"
+                                 f"👤 فهد العتيبي\n💼 مطور\n🔗 @fahad_dev\n📅 انضم: {today}")
 
+
+# -- the /team button panel ---------------------------------------------------------------------------
+
+def _panel(mod):
+    """A gateway whose adapter knows the manager (id MANAGER) from anyone else, the way Telegram's does."""
     gw = FakeGateway(bot=True)
-    bot = gw.adapter._bot
-    assert _dispatch(mod, gw, _event(text="/contacts edit نورة", message_type="TEXT")) is None
-    edit = max(bot.messages)
-    assert bot.messages[edit][0].startswith("✏️ نورة السالم\nالاسم المختصر: نورة\nالاسم الكامل: نورة السالم")
-    assert "التواصل: ⏳ لم ينضم بعد — أرسل /invite" in bot.messages[edit][0]
-    noura = mod.contacts.exact("نورة")["id"]
-    assert _buttons(bot.messages[edit][1]) == [[("👤 الاسم الكامل", f"rec:p:f:{noura}"), ("💼 الوظيفة", f"rec:p:r:{noura}")]]
-    assert _press(mod, gw.adapter, f"rec:p:r:{noura}", edit, user="99") == ["Not allowed."]
-    _press(mod, gw.adapter, f"rec:p:r:{noura}", edit)
-    assert gw.adapter.sent[-1] == "أرسل الوظيفة / القسم لـ نورة"
-    assert _dispatch(mod, gw, _event(text="تصميم", message_type="TEXT")) is None
-    assert mod.contacts.exact("نورة")["role"] == "تصميم" and mod.contacts.label_for("نورة") == "نورة السالم (تصميم)"
-    # A first name that fits two people asks which one (an exact short name is one person).
-    mod.contacts.set_details("سعد أ", full_name="سعد الأحمد")
-    mod.contacts.set_details("سعد ب", full_name="سعد البكر")
-    assert _dispatch(mod, gw, _event(text="/contacts edit سعد", message_type="TEXT")) is None
-    assert [b for row in _buttons(bot.messages[max(bot.messages)][1]) for b, _ in row] == ["سعد الأحمد", "سعد البكر"]
-    assert _dispatch(mod, gw, _event(text="/contacts edit فهد", message_type="TEXT")) is None
-    assert bot.messages[max(bot.messages)][0].startswith("✏️ فهد العتيبي (مطور)\nالاسم المختصر: فهد\n")
+    gw.adapter._is_callback_user_authorized = lambda user_id, **_kw: str(user_id) == MANAGER
+    return gw, gw.adapter._bot
 
-    # Deleting a registered member asks first; afterwards they are gone from /team and get no tasks.
-    assert _dispatch(mod, gw, _event(text="/contacts delete فهد الشمري", message_type="TEXT")) is None
-    question = max(bot.messages)
-    assert bot.messages[question][0] == ("🗑️ حذف فهد الشمري (مالية) من جهات الاتصال؟ هو مسجّل في البوت وسيتوقف "
-                                         "عن استقبال المهام.")
-    assert "فهد الشمري" in mod._cmd_team("")  # not before ✅
-    _press(mod, gw.adapter, "rec:p:d:2", question)
-    assert "فهد الشمري" not in mod._cmd_team("") and mod._cmd_team("").startswith("👥 الفريق (1)")
-    assert mod.contacts.route("فهد ش").reason == "not_joined"
+
+def _open_team(mod, gw):
+    bot = gw.adapter._bot
+    assert _dispatch(mod, gw, _event(text="/team", message_type="TEXT")) is None
+    return max(bot.messages)
+
+
+def _labels(bot, message_id):
+    return [[b for b, _ in row] for row in _buttons(bot.messages[message_id][1])]
+
+
+def _tap(mod, gw, message_id, label, user=MANAGER):
+    """Press the button of *message_id* whose label is *label*."""
+    data = next(cb for row in _buttons(gw.adapter._bot.messages[message_id][1]) for b, cb in row if b == label)
+    _press(mod, gw.adapter, data, message_id, user=user)
+    return data
+
+
+def _text(mod, gw, text):
+    return _dispatch(mod, gw, _event(text=text, message_type="TEXT"))
+
+
+def test_team_panel_lists_joined_and_not_joined_people_and_invites(recorder, telegram_stub):
+    mod = recorder
+    _two_fahads(mod)
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, "ar", {"summary": []}, [
+        {"person": "خالد", "person_key": "خالد", "candidates": [], "task": "t", "deadline": ""}])
+    mod.store.set_task_status(meeting_id, [1], "confirmed")
+    gw, bot = _panel(mod)
+    gw.adapter._current_bot_username = lambda: "tactbot"
+    panel = _open_team(mod, gw)
+    assert bot.messages[panel][0].startswith("👥 الفريق (3)")
+    assert _labels(bot, panel) == [["👤 فهد الشمري — مالية"], ["👤 فهد العتيبي — مطور"],
+                                   ["⏳ خالد — لم ينضم"], ["➕ دعوة شخص جديد"]]
+    for row in _buttons(bot.messages[panel][1]):  # platform-neutral limits
+        assert all(len(cb) <= 200 for _, cb in row)
+    # The invite button gives the same 30-minute link as /invite.
+    _tap(mod, gw, panel, "➕ دعوة شخص جديد")
+    assert re.search(r"https://t\.me/tactbot\?start=join_\S+", gw.adapter.sent[-1]) and "30" in gw.adapter.sent[-1]
+    # A long name is cut with "…" so labels stay short.
+    mod.contacts.set_details("فهد", full_name="عبد الرحمن بن عبد العزيز بن سعود الكبير")
+    again = _open_team(mod, gw)
+    assert any(label.endswith("…") and len(label) <= 30 for row in _labels(bot, again) for label in row)
+
+
+def test_team_panel_empty_team_offers_only_the_invite_button(recorder, telegram_stub):
+    mod = recorder
+    gw, bot = _panel(mod)
+    panel = _open_team(mod, gw)
+    assert bot.messages[panel][0] == "👥 لا يوجد أحد في الفريق بعد."
+    assert _labels(bot, panel) == [["➕ دعوة شخص جديد"]]
+
+
+def test_team_panel_details_and_each_field_edit_in_the_same_message(recorder, telegram_stub):
+    mod = recorder
+    _two_fahads(mod)
+    mod.store.create_meeting("telegram", CHAT, MANAGER)
+    gw, bot = _panel(mod)
+    panel = _open_team(mod, gw)
+    _tap(mod, gw, panel, "👤 فهد العتيبي — مطور")
+    today = mod.store.now().isoformat()[:10]
+    assert bot.messages[panel][0] == ("👤 فهد العتيبي\nالاسم المختصر: فهد\n💼 الوظيفة: مطور\n🔗 @fahad_dev\n"
+                                      f"📅 انضم: {today}")
+    assert _labels(bot, panel) == [["✏️ الاسم المختصر", "✏️ الاسم الكامل", "💼 الوظيفة"], ["🗑️ إزالة", "↩️ رجوع"]]
+    shown = len(bot.messages)
+
+    # Full name, role, then the short name (which also updates linked tasks): each shows the card again.
+    _tap(mod, gw, panel, "✏️ الاسم الكامل")
+    assert bot.messages[panel][0].startswith("أرسل الاسم الكامل الجديد لـ فهد")
+    assert _labels(bot, panel) == [["❌ إلغاء"]]
+    assert _text(mod, gw, "فهد الدوسري") is None
+    assert bot.messages[panel][0].startswith("✅ حُفظ.\n\n👤 فهد الدوسري\n")
+    _tap(mod, gw, panel, "💼 الوظيفة")
+    assert _text(mod, gw, "مدير تقنية") is None
+    assert "💼 الوظيفة: مدير تقنية" in bot.messages[panel][0]
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, "ar", {"summary": []}, [
+        {"person": "فهد", "person_key": "فهد", "candidates": [], "task": "t", "deadline": ""}])
+    _tap(mod, gw, panel, "✏️ الاسم المختصر")
+    assert _text(mod, gw, "فهد ش") is None  # taken by the other Fahad: refused, still waiting
+    assert "موجود بالفعل" in bot.messages[panel][0] and _labels(bot, panel) == [["❌ إلغاء"]]
+    assert _text(mod, gw, "فيصل") is None
+    assert bot.messages[panel][0].startswith("✏️ أُعيدت تسمية فهد إلى فيصل (في 1 مهمة).")
+    assert mod.contacts.exact("فيصل")["telegram_chat_id"] == "801"
+    assert [t["person"] for t in mod.store.tasks_for(meeting_id)] == ["فيصل"]
+    assert len(bot.messages) == shown  # everything edited the one message; nothing new was sent
+    _tap(mod, gw, panel, "↩️ رجوع")
+    assert bot.messages[panel][0].startswith("👥 الفريق (2)")
+
+
+def test_team_panel_cancel_and_timeout_leave_the_value_alone(recorder, telegram_stub, monkeypatch):
+    mod = recorder
+    _two_fahads(mod)
+    gw, bot = _panel(mod)
+    panel = _open_team(mod, gw)
+    _tap(mod, gw, panel, "👤 فهد العتيبي — مطور")
+    _tap(mod, gw, panel, "💼 الوظيفة")
+    _tap(mod, gw, panel, "❌ إلغاء")
+    assert bot.messages[panel][0].startswith("👤 فهد العتيبي\n")
+    assert not asyncio.run(mod.team.take_input(gw.adapter, "telegram", CHAT, MANAGER, "مصمم"))  # cancelled
+    assert mod.contacts.exact("فهد")["role"] == "مطور"
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod.team.time, "monotonic", lambda: clock[0])
+    _tap(mod, gw, panel, "💼 الوظيفة")
+    clock[0] += 5 * 60 + 1  # the wait expired
+    assert not asyncio.run(mod.team.take_input(gw.adapter, "telegram", CHAT, MANAGER, "مصمم"))
+    assert mod.contacts.exact("فهد")["role"] == "مطور"
+    _tap(mod, gw, panel, "❌ إلغاء")  # the stale prompt's cancel still returns to the details
+    clock[0] = 1000.0
+    _tap(mod, gw, panel, "💼 الوظيفة")  # within five minutes: it works
+    assert asyncio.run(mod.team.take_input(gw.adapter, "telegram", CHAT, MANAGER, "مصمم"))
+    assert mod.contacts.exact("فهد")["role"] == "مصمم"
+    # Typed values are only read from the manager who asked.
+    _tap(mod, gw, panel, "💼 الوظيفة")
+    assert not asyncio.run(mod.team.take_input(gw.adapter, "telegram", CHAT, "99", "هاكر"))
+
+
+def test_team_panel_remove_asks_then_acts_like_the_old_contacts_delete(recorder, telegram_stub):
+    mod = recorder
+    _two_fahads(mod)
+    meeting_id = mod.store.create_meeting("telegram", CHAT, MANAGER)
+    mod.store.save_analysis(meeting_id, "ar", {"summary": []}, [
+        {"person": "خالد", "person_key": "خالد", "candidates": [], "task": "t", "deadline": ""}])
+    mod.store.set_task_status(meeting_id, [1], "confirmed")
+    gw, bot = _panel(mod)
+    panel = _open_team(mod, gw)
+    _tap(mod, gw, panel, "👤 فهد الشمري — مالية")
+    _tap(mod, gw, panel, "🗑️ إزالة")
+    assert bot.messages[panel][0] == "إزالة فهد ش؟ لن يستقبل مهام بعد الآن"
+    assert _labels(bot, panel) == [["✅ نعم", "❌ لا"]]
+    _tap(mod, gw, panel, "❌ لا")  # back to the details, nothing removed
+    assert bot.messages[panel][0].startswith("👤 فهد الشمري\n") and mod.contacts.exact("فهد ش")
+    _tap(mod, gw, panel, "🗑️ إزالة")
+    _tap(mod, gw, panel, "✅ نعم")
+    assert mod.contacts.exact("فهد ش") is None and mod.contacts.route("فهد ش").reason == "not_joined"
+    assert bot.messages[panel][0].startswith("🗑️ أُزيل فهد ش.") and "الشمري" not in bot.messages[panel][0]
+    # A person only seen in meetings: short name + remove + back, and an invite button.
+    _tap(mod, gw, panel, "⏳ خالد — لم ينضم")
+    assert bot.messages[panel][0].startswith("⏳ خالد\nلم ينضم بعد")
+    assert _labels(bot, panel) == [["✏️ الاسم المختصر", "🗑️ إزالة", "↩️ رجوع"], ["➕ دعوة"]]
+    gw.adapter._current_bot_username = lambda: "tactbot"
+    _tap(mod, gw, panel, "➕ دعوة")
+    assert "t.me/tactbot?start=join_" in gw.adapter.sent[-1]
+    _tap(mod, gw, panel, "✏️ الاسم المختصر")
+    assert _text(mod, gw, "خالد س") is None
+    assert bot.messages[panel][0].startswith("✏️ أُعيدت تسمية خالد إلى خالد س (في 1 مهمة).")
+    assert [t["person"] for t in mod.store.tasks_for(meeting_id)] == ["خالد س"]
+    _tap(mod, gw, panel, "🗑️ إزالة")
+    _tap(mod, gw, panel, "✅ نعم")
+    assert mod.contacts.not_joined("telegram", CHAT) == []
+
+
+def test_team_panel_ignores_everyone_but_the_manager_and_contacts_is_gone(recorder, telegram_stub):
+    mod = recorder
+    _two_fahads(mod)
+    gw, bot = _panel(mod)
+    panel = _open_team(mod, gw)
+    person = next(cb for row in _buttons(bot.messages[panel][1]) for b, cb in row if b.startswith("👤 فهد العتيبي"))
+    before = dict(bot.messages)
+    assert _press(mod, gw.adapter, person, panel, user="99") == [None]  # nothing: no toast, no edit
+    assert _press(mod, gw.adapter, "rec:t:y:" + person.rsplit(":", 1)[1], panel, user="99") == [None]
+    assert bot.messages == before and mod.contacts.exact("فهد")
+    # Someone else's typed text is never taken as a value, even with an input pending.
+    _tap(mod, gw, panel, "👤 فهد العتيبي — مطور")
+    _tap(mod, gw, panel, "💼 الوظيفة")
+    assert not asyncio.run(mod.team.take_input(gw.adapter, "telegram", CHAT, "99", "x"))
+    # An adapter that can't tell who the manager is fails closed.
+    plain = FakeGateway(bot=True)
+    assert _press(mod, plain.adapter, person, panel) == [None] and not plain.adapter._bot.messages
+    # /contacts no longer exists as a command or a menu entry; the hook leaves it alone.
+    assert not hasattr(mod, "_cmd_contacts")
+    from hermes_cli.plugins import get_plugin_commands
+    assert "contacts" not in get_plugin_commands() and {"team", "invite"} <= set(get_plugin_commands())
 
 
 def test_invite_edge_cases_self_invite_expiry_reopen_and_restart(recorder, telegram_stub, monkeypatch):
@@ -1256,7 +1404,7 @@ def test_invite_edge_cases_self_invite_expiry_reopen_and_restart(recorder, teleg
 
     # "Restart": every in-memory state is gone; the buttons work from the database alone.
     for state in (mod.invite.awaiting_name, mod.invite.awaiting_detail, mod.invite._attempts,
-                  mod._awaiting_edit, mod._person_actions, mod._awaiting_person):
+                  mod._awaiting_edit, mod.team._awaiting):
         state.clear()
     _press(mod, gw.adapter, "rec:j:a:2:0", resent)
     assert mod.contacts.find("Ahmad")["telegram_chat_id"] == "555"
