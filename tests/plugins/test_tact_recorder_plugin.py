@@ -1574,3 +1574,30 @@ def test_llm_without_temperature_parameter_still_works(recorder):
         return SimpleNamespace(parsed=dict(GAPPY, decisions=["d"]), text="", finish_reason="stop")
     _, brief, _ = asyncio.run(recorder.brief.analyze(SimpleNamespace(acomplete_structured=old), "short"))
     assert calls == ["meeting_brief"] and brief["decisions"] == ["d"]
+
+
+MULTI = "تكليف فهد بحل مشكلة آبل باي قبل الأربعاء، ونورة بتعديل التصاميم وإرسالها بكرة، وبدء ريم الاختبار الشامل يوم الأحد القادم"
+THREE = [{"owner": "فهد", "task": "حل مشكلة آبل باي", "deadline": "قبل الأربعاء"},
+         {"owner": "نورة", "task": "تعديل التصاميم وإرسالها", "deadline": "بكرة"},
+         {"owner": "ريم", "task": "بدء الاختبار الشامل", "deadline": "يوم الأحد القادم"}]
+PEOPLE = [{"name": "فهد"}, {"name": "نورة"}, {"name": "ريم"}]
+
+
+def test_multi_person_assignment_decision_adds_no_task_but_stays(recorder):
+    _, brief, tasks = recorder.brief.normalize({"people": PEOPLE, "decisions": [MULTI], "tasks": THREE})
+    assert len(tasks) == 3 and brief["decisions"] == [MULTI]
+    _, _, tasks = recorder.brief.normalize({"people": PEOPLE, "decisions": [MULTI], "tasks": []})
+    assert tasks == []  # even with no tasks listed, a multi-person sentence is never one task
+
+
+def test_single_person_decision_for_a_new_task_is_still_added(recorder):
+    _, _, tasks = recorder.brief.normalize({"people": PEOPLE, "decisions": ["تكليف ريم بكتابة تقرير الأداء قبل الخميس"],
+                                            "tasks": THREE})
+    assert len(tasks) == 4 and tasks[3]["person"] == "ريم" and tasks[3]["deadline"] == "قبل الخميس"
+
+
+def test_same_owner_reworded_task_is_not_duplicated(recorder):
+    tasks_in = [{"owner": "فهد", "task": "حل مشكلة الدفع بآبل باي", "deadline": "الأربعاء"}]
+    _, brief, tasks = recorder.brief.normalize({"people": PEOPLE, "decisions": ["تكليف فهد بإصلاح مشكلة آبل باي"],
+                                                "tasks": tasks_in})
+    assert len(tasks) == 1 and len(brief["decisions"]) == 1

@@ -324,12 +324,28 @@ def _leading_name(text: str, known: Dict[str, str], allow_unknown: bool) -> Tupl
     return "", text
 
 
+def _mentions_other_person(text: str, known: Dict[str, str], person: str) -> bool:
+    """Whether *text* names a known person (any alias) other than *person*; "ونورة" counts as نورة."""
+    words = [w for w in (x.strip("،,.:;!؟?()\"'") for x in text.split()) if w]
+    for i in range(len(words)):
+        for n in (1, 2, 3):
+            chunk = " ".join(words[i:i + n])
+            for form in (chunk, chunk[1:] if chunk.startswith("و") else chunk):
+                other = known.get(name_key(form))
+                if other and name_key(other) != name_key(person):
+                    return True
+    return False
+
+
 def assignment(text: str, known: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    """The task a sentence assigns to one person, or None when it is not phrased as an assignment."""
+    """The task a sentence assigns to one person, or None when it is not phrased as an assignment
+    (a sentence that also names another known person assigns several people: never one task)."""
     text = re.sub(r"\s*([:：])", r" \1", clean(text))  # "خالد: ..." -> "خالد : ..."
     verb = _ASSIGN_VERB_RE.match(text) or _ON_RE.match(text)
     name, rest = _leading_name(text[verb.end():] if verb else text, known, allow_unknown=bool(verb))
     if not name:
+        return None
+    if _mentions_other_person(rest, known, name):
         return None
     connector = _CONNECTOR_RE.match(rest)
     if (not verb or verb.groupdict().get("en")) and not connector.group(0).strip():
@@ -346,6 +362,41 @@ def assignment(text: str, known: Dict[str, str]) -> Optional[Dict[str, Any]]:
             "contact": ""}
 
 
+_FILLER_WORDS = frozenset({"و", "في", "من", "على", "الى", "عن", "مع", "ب", "ل", "the", "to", "a", "an", "of",
+                           "for", "and", "in", "with", "by", "on", "at"})
+_OVERLAP = 0.5  # share of the shorter task's meaningful words that makes two tasks "the same"
+_LENGTH_FACTOR = 2
+
+
+def _content_words(task: str) -> set:
+    """Meaningful words of a task sentence: deadline dropped, small words and Arabic one-letter /
+    definite-article prefixes (و ب ل ال) stripped."""
+    words = set()
+    for word in name_key(split_trailing_deadline(clean(task))[0]).split():
+        word = word.strip("،,.:;!؟?")
+        if word.startswith("ال") and len(word) > 4:
+            word = word[2:]
+        elif word[:1] in ("و", "ب", "ل") and len(word) > 3:
+            word = word[1:]
+        if len(word) > 1 and word not in _FILLER_WORDS:
+            words.add(word)
+    return words
+
+
+def _already_a_task(new: Dict[str, Any], tasks: List[Dict[str, Any]]) -> bool:
+    key = name_key(new["task"])
+    if any(key in name_key(t["task"]) or name_key(t["task"]) in key for t in tasks):
+        return True
+    mine, words = {name_key(o) for o in split_owners(new["person"])}, _content_words(new["task"])
+    for t in tasks:
+        if not mine & {name_key(o) for o in split_owners(t["person"])}:
+            continue
+        theirs = _content_words(t["task"])
+        if words and theirs and len(words & theirs) >= _OVERLAP * min(len(words), len(theirs)):
+            return True
+    return False
+
+
 def move_assignments(brief: Dict[str, Any], tasks: List[Dict[str, Any]], known: Dict[str, str]) -> None:
     """Decisions that assign work also become tasks (unless already listed; the decision stays in
     the brief), and an unclear task whose text is itself an assignment to one known person gets that
@@ -355,8 +406,10 @@ def move_assignments(brief: Dict[str, Any], tasks: List[Dict[str, Any]], known: 
         task = assignment(item, known)
         if task is None:
             continue
-        key = name_key(task["task"])
-        if not any(key in name_key(t["task"]) or name_key(t["task"]) in key for t in tasks):
+        longest = max((len(t["task"]) for t in tasks), default=0)
+        if longest and len(task["task"]) > _LENGTH_FACTOR * longest:
+            continue  # far longer than any real task: several assignments run together
+        if not _already_a_task(task, tasks):
             tasks.append(task)
             moved += 1
     claimed = 0
