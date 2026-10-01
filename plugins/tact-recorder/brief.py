@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 # A long Arabic meeting's brief and task list runs to thousands of tokens; the provider default
 # can cut it off mid-JSON.
 MAX_TOKENS = 8000
+TEMPERATURE = 0.2  # the same audio should give nearly the same brief
+RLM = "\u200f"  # right-to-left mark: keeps a bullet at the start of an Arabic line on WhatsApp
 STRICT_RETRY = "Return ONLY one valid JSON object, no prose, no code fences."
 FOLLOWUP_MAX_TOKENS = 2000
 FOLLOWUP_MIN_TRANSCRIPT = 1500  # characters: shorter meetings may genuinely decide nothing
@@ -81,11 +83,16 @@ speech recognition: it can be Arabic, English or both mixed, and may contain rec
 
 Return JSON only, with these fields:
 - language: "ar" if the meeting is mainly Arabic, otherwise "en". Write every text field in that language.
-- summary: 5 to 8 short lines summarising the whole meeting.
+- summary: 5 to 8 short lines covering EVERY agenda topic, in the order discussed. Each line must be
+  specific: it names WHO (the person), WHAT (was said, decided or assigned) and every NUMBER, AMOUNT,
+  PERCENTAGE or DATE that was said. Example: "تم صرف 70% من ميزانية الربع الرابع، واقترح خالد تخفيض
+  مصاريف السفر 20%". Vague lines are forbidden: never write "تكليف الفريق بعدة مهام" or "discussed several
+  tasks"; name the people and what each one got instead.
 - decisions: everything decided or agreed in the meeting ("قررنا", "اتفقنا", "موافق", "we agreed",
-  "let's go with"), one per item (empty list only if nothing was decided).
-- open_issues: everything postponed, left unresolved or still to be decided, one per item (empty
-  list only if there is none).
+  "let's go with"), one per item, INCLUDING who was assigned what and by when (empty list only if
+  nothing was decided).
+- open_issues: EVERY postponed, unresolved or still-to-be-decided item, one per item, e.g. a pending
+  discount request, hiring postponed until the budget report (empty list only if there is none).
 summary, decisions and open_issues are lists of plain strings: one sentence per item, never objects.
 - people: every person who is given a task, once each: {"name": one spelling, in the meeting's
   language, "aliases": every other spelling or script used for the same person, e.g. أحمد and Ahmad}.
@@ -340,19 +347,18 @@ def assignment(text: str, known: Dict[str, str]) -> Optional[Dict[str, Any]]:
 
 
 def move_assignments(brief: Dict[str, Any], tasks: List[Dict[str, Any]], known: Dict[str, str]) -> None:
-    """Decisions that assign work become tasks (unless already listed), and an unclear task whose
-    text is itself an assignment to one known person gets that owner. In place."""
-    kept, moved = [], 0
+    """Decisions that assign work also become tasks (unless already listed; the decision stays in
+    the brief), and an unclear task whose text is itself an assignment to one known person gets that
+    owner. In place."""
+    moved = 0
     for item in brief["decisions"]:
         task = assignment(item, known)
         if task is None:
-            kept.append(item)
             continue
         key = name_key(task["task"])
         if not any(key in name_key(t["task"]) or name_key(t["task"]) in key for t in tasks):
             tasks.append(task)
-        moved += 1
-    brief["decisions"] = kept
+            moved += 1
     claimed = 0
     for task in tasks:
         if task["person"]:
@@ -363,7 +369,7 @@ def move_assignments(brief: Dict[str, Any], tasks: List[Dict[str, Any]], known: 
                         task=found["task"], deadline=task["deadline"] or found["deadline"])
             claimed += 1
     if moved or claimed:
-        logger.info("tact-recorder: moved %d assignment(s) from decisions to tasks, gave %d unclear task(s) "
+        logger.info("tact-recorder: added %d task(s) from assignment decisions, gave %d unclear task(s) "
                     "their named owner", moved, claimed)
 
 
@@ -445,15 +451,24 @@ class _Route:
     def __init__(self, model: Optional[str]):
         self.model = model
 
+    @staticmethod
+    async def _complete(llm: Any, **kw: Any) -> Any:
+        try:
+            return await llm.acomplete_structured(**kw, temperature=TEMPERATURE)
+        except TypeError as exc:  # an llm facade without a temperature parameter
+            if "temperature" not in str(exc):
+                raise
+            return await llm.acomplete_structured(**kw)
+
     async def call(self, llm: Any, **kw: Any) -> Any:
         if self.model:
             try:
-                return await llm.acomplete_structured(**kw, model=self.model)
+                return await self._complete(llm, **kw, model=self.model)
             except Exception as exc:  # unavailable, auth, trust gate, ...: the brief must still be written
                 logger.warning("tact-recorder: brief model %s failed (%s); falling back to the main chat model",
                                self.model, type(exc).__name__)
                 self.model = None
-        return await llm.acomplete_structured(**kw)
+        return await self._complete(llm, **kw)
 
 
 async def analyze(llm: Any, transcript: str, note: str = "",
@@ -626,8 +641,13 @@ def combined_text(tasks: List[Dict[str, Any]], total: int, lang: str) -> str:
             + "\n\n".join(task_card(t, total, lang) for t in tasks) + f"\n\n{labels['text_help']}")
 
 
+def _rtl(lang: str) -> str:
+    return RLM if lang == "ar" else ""
+
+
 def _bullets(items: List[str], lang: str) -> str:
-    return "\n".join(f"- {item}" for item in items) if items else f"- {LABELS[lang]['none']}"
+    mark = _rtl(lang)
+    return "\n".join(f"{mark}- {item}" for item in items) if items else f"{mark}- {LABELS[lang]['none']}"
 
 
 def brief_text(meeting_id: int, created_at: str, lang: str, brief: Dict[str, Any],
@@ -640,7 +660,7 @@ def brief_text(meeting_id: int, created_at: str, lang: str, brief: Dict[str, Any
         tasks_line = labels["tasks_next" if cards else "tasks_below"].format(n=n_tasks)
     return "\n\n".join([
         f"🎙️ {labels['meeting']} #{meeting_id} — {created_at[:16].replace('T', ' ')}",
-        f"{labels['summary']}\n" + "\n".join(brief.get("summary") or [labels["none"]]),
+        f"{labels['summary']}\n" + "\n".join(f"{_rtl(lang)}{line}" for line in brief.get("summary") or [labels["none"]]),
         f"{labels['decisions']}\n{_bullets(brief.get('decisions') or [], lang)}",
         f"{labels['open']}\n{_bullets(brief.get('open_issues') or [], lang)}",
         tasks_line])

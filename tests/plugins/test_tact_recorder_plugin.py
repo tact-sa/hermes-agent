@@ -688,7 +688,8 @@ def test_assignments_filed_as_decisions_become_tasks(recorder):
                       "تكليف عمر بالتواصل مع شركة النخبة بكرة", "تكليف سارة بإرسال الدعوات"],
         "tasks": [{"owner": "", "owner_candidates": ["سارة", "عمر"], "task": "سارة: إرسال الدعوات"},
                   {"owner": "", "owner_candidates": ["خالد", "عمر"], "task": "الاتصال بالمورد"}]})
-    assert brief["decisions"] == ["خفض ميزانية السفر 20%"]
+    assert brief["decisions"] == ["تكليف خالد بإعداد تقرير المبيعات قبل يوم الخميس", "خفض ميزانية السفر 20%",
+                                  "تكليف عمر بالتواصل مع شركة النخبة بكرة", "تكليف سارة بإرسال الدعوات"]
     assert [(t["person"], t["task"], t["deadline"], t["candidates"]) for t in tasks] == [
         ("سارة", "إرسال الدعوات", "", []),  # the text names its one owner: not unclear
         ("", "الاتصال بالمورد", "", ["خالد", "عمر"]),  # genuinely unclear stays unclear
@@ -697,7 +698,7 @@ def test_assignments_filed_as_decisions_become_tasks(recorder):
     _, brief, tasks = recorder.brief.normalize({
         "people": [{"name": "Omar"}], "tasks": [],
         "decisions": ["Omar will send the deck by Tuesday", "Launch moves to May", "Task force created"]})
-    assert brief["decisions"] == ["Launch moves to May", "Task force created"]
+    assert brief["decisions"] == ["Omar will send the deck by Tuesday", "Launch moves to May", "Task force created"]
     assert [(t["person"], t["task"], t["deadline"]) for t in tasks] == [("Omar", "send the deck", "by Tuesday")]
 
 
@@ -1535,3 +1536,41 @@ def test_linked_members_show_as_full_name_and_role_others_keep_the_meeting_name(
     _press(mod, gw.adapter, f"rec:x:s:{meeting_id}", max(gw.adapter._bot.messages))
     (message,) = gw.adapter._bot.sent_to("801")
     assert message.startswith("👤 أحمد السالم (مطور)\n📋 مهامك من اجتماع ")
+
+
+def test_assignment_decisions_are_kept_and_never_duplicate_tasks(recorder):
+    fmt = recorder.brief
+    parsed = {"people": [{"name": "خالد"}], "decisions": ["تكليف خالد بإعداد التقرير قبل الخميس"],
+              "tasks": [{"owner": "خالد", "task": "إعداد التقرير", "deadline": "قبل الخميس"}]}
+    _, brief, tasks = fmt.normalize(parsed)
+    assert brief["decisions"] == ["تكليف خالد بإعداد التقرير قبل الخميس"] and len(tasks) == 1
+    fmt.move_assignments(brief, tasks, {fmt.name_key("خالد"): "خالد"})  # a second pass adds nothing
+    assert len(tasks) == 1 and len(brief["decisions"]) == 1
+
+
+def test_rlm_prefix_on_bullets_and_summary_only_in_arabic(recorder):
+    fmt = recorder.brief
+    brief = {"summary": ["صرف 70% من الميزانية"], "decisions": ["d"], "open_issues": []}
+    ar = fmt.brief_text(1, "2026-10-01T10:00", "ar", brief, 0)
+    assert "\u200f- d" in ar and "\u200f- " + fmt.LABELS["ar"]["none"] in ar and "\u200fصرف 70%" in ar
+    en = fmt.brief_text(1, "2026-10-01T10:00", "en", {"summary": ["Spent 70%"], "decisions": ["d"], "open_issues": []}, 0)
+    assert "\u200f" not in en and "\n- d" in en
+
+
+def test_brief_calls_pass_low_temperature_and_fallback_keeps_it(recorder):
+    llm = RoutedLlm(broken_model=GEMINI, meeting_brief=GAPPY,
+                    meeting_decisions={"decisions": ["d"], "open_issues": []},
+                    meeting_deadlines={"deadlines": [{"n": 1, "deadline": "بكرة"}]})
+    asyncio.run(recorder.brief.analyze(llm, GAPPY_TRANSCRIPT, model=GEMINI))
+    assert len(llm.calls) == 4 and all(c["temperature"] == 0.2 for c in llm.calls)
+    assert [c.get("model") for c in llm.calls] == [GEMINI, None, None, None]  # fallback intact
+
+
+def test_llm_without_temperature_parameter_still_works(recorder):
+    calls = []
+
+    async def old(*, instructions, input, json_schema, schema_name, purpose, timeout, max_tokens):
+        calls.append(schema_name)
+        return SimpleNamespace(parsed=dict(GAPPY, decisions=["d"]), text="", finish_reason="stop")
+    _, brief, _ = asyncio.run(recorder.brief.analyze(SimpleNamespace(acomplete_structured=old), "short"))
+    assert calls == ["meeting_brief"] and brief["decisions"] == ["d"]
